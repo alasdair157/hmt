@@ -932,23 +932,23 @@ class HMTree(Tree, HMModel):
         return total + r * (r ** 2 + r - 2) / 2
     
 
-    def sample(self, N, p, nodeclass=SDHMNode):
+    def sample(self, N, p):
         s = np.random.choice(np.arange(self.n_hidden), p=self.init_s_distr)
         x = np.squeeze(np.random.multivariate_normal(self.mus[s], self.sigmas[s], 1))
         if self.n_obs == 1:
             x = float(x)
-        self.root = nodeclass(1, observed=x, tree=self, s=s)
+        self.root = HMNode(1, observed=x, tree=self, s=s)
         self.root.sample(N, p)
     
 
-    def sample_both(self, N, p):
-        tree = HMTree(self.n_hidden, self.n_obs, self.sister_dep, self.daughter_order)
-        s = np.random.choice(np.arange(self.n_hidden), p=self.init_s_distr)
-        x = np.squeeze(np.random.multivariate_normal(self.mus[s], self.sigmas[s], 1))
-        self.root = SDHMNode(1, observed=x, tree=self, s=s)
-        tree.root = HMNode(1, observed=x, tree=tree, s=s)
-        self.root.sample(N, p, tree.root)
-        return tree
+    # def sample_both(self, N, p):
+    #     tree = HMTree(self.n_hidden, self.n_obs, self.sister_dep, self.daughter_order)
+    #     s = np.random.choice(np.arange(self.n_hidden), p=self.init_s_distr)
+    #     x = np.squeeze(np.random.multivariate_normal(self.mus[s], self.sigmas[s], 1))
+    #     self.root = SDHMNode(1, observed=x, tree=self, s=s)
+    #     tree.root = HMNode(1, observed=x, tree=tree, s=s)
+    #     self.root.sample(N, p, tree.root)
+    #     return tree
 
 
 class HMForest(Forest, HMModel):
@@ -978,14 +978,13 @@ class HMForest(Forest, HMModel):
     [2] - Me :)
     """
     def __init__(self, n_hidden, n_obs, sister_dep=True, daughter_order=False):
-        NodeClass = SDHMNode if sister_dep else HMNode
         tree_kwargs = {
             "n_hidden" : n_hidden,
             "n_obs" : n_obs,
             "sister_dep" : sister_dep,
             "daughter_order" : daughter_order
         }
-        super().__init__(HMTree, NodeClass, tree_kwargs)
+        super().__init__(HMTree, HMNode, tree_kwargs)
 
         # Model parameters
         self.n_hidden = n_hidden
