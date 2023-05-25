@@ -221,6 +221,31 @@ class HMNode(Node):
         Maximum likelihood estimate for the value of S_u, takes values of
         0, ..., n where n is the number of possible hidden states
     
+    (FROM SDHMNODE - TODO CLEAN UP)
+    id, y, d0, d1, mother, tree
+        See documentation for tree.Node
+    s_distr, sc_distr: np.ndarrays
+        Distibutions of hidden states for current node and its children: 
+        s_distr[i] = P(S_u = i)
+        sc_distr[j, k] = P(S_c(u) = (j, k))
+    beta_c, beta_c_u: np.ndarrays
+        Intermediate distributions used in later calculations:
+        beta_c[j, k] = P
+        beta_c_u[i] = 
+        see [1] for more details
+    xi_f, xi_c, xi: np.ndarray
+        Conditional distributions of hidden states given data:
+        xi_f[i, j, k] = P(S_f(u) = (i, j, k) | observed data)
+        xi[i] = P(S_u = i | observed data)
+        xi_c[j, k] = P(S_c(u) = (j, k) | observed data)
+    m_d_xi: np.ndarray
+        Distribution of hidden states for this node and mother
+        m_d_xi[i, j] = P(S_u = j, S_m = i | observed data)
+        where m is the mother node.
+    ml_s: int
+        Maximum likelihood estimate for the value of S_u, takes values of
+        0, ..., n where n is the number of possible hidden states
+    
     Methods
     -------
 
@@ -567,267 +592,6 @@ class HMNode(Node):
             d1._path = self._path + '1'
             self.d1 = d1
             self.d1.sample(N1, p)
-
-
-class SDHMNode(Node):
-    """
-    Hidden Markov Node in which the hidden states are dependent on the sister node as well
-    as the parent node.
-
-    Attributes
-    ----------
-    id, y, d0, d1, mother, tree
-        See documentation for tree.Node
-    s_distr, sc_distr: np.ndarrays
-        Distibutions of hidden states for current node and its children: 
-        s_distr[i] = P(S_u = i)
-        sc_distr[j, k] = P(S_c(u) = (j, k))
-    beta_c, beta_c_u: np.ndarrays
-        Intermediate distributions used in later calculations:
-        beta_c[j, k] = P
-        beta_c_u[i] = 
-        see [1] for more details
-    xi_f, xi_c, xi: np.ndarray
-        Conditional distributions of hidden states given data:
-        xi_f[i, j, k] = P(S_f(u) = (i, j, k) | observed data)
-        xi[i] = P(S_u = i | observed data)
-        xi_c[j, k] = P(S_c(u) = (j, k) | observed data)
-    m_d_xi: np.ndarray
-        Distribution of hidden states for this node and mother
-        m_d_xi[i, j] = P(S_u = j, S_m = i | observed data)
-        where m is the mother node.
-    ml_s: int
-        Maximum likelihood estimate for the value of S_u, takes values of
-        0, ..., n where n is the number of possible hidden states
-
-    Methods
-    -------
-
-    References
-    ----------
-    [1] Me :)
-    """
-    def __init__(self, node_id, observed, tree=None, s=None):
-        super().__init__(node_id, observed, tree)
-        self.s_distr = None
-        self.sc_distr = None
-
-        self.beta_c = None
-        self.beta_c_u = None
-
-        self.xi = None
-        self.xi_c = None
-        self.xi_f = None
-
-        self.ml_s = None
-        self.s = s
-
-
-    def calculate_s_distr(self, drec=False):
-        if self.mother is None and self.s_distr is None:
-            raise HMTError('Root node has no initial distribution.')
-        
-        if not np.isclose(np.sum(self.s_distr), 1):
-            raise HMTError('S distribution probabilities do not sum to 1.')
-
-        # Calculate children distribution
-        self.sc_distr = (self.tree.P.T @ self.s_distr).T
-
-        if not np.isclose(np.sum(self.sc_distr), 1):
-            print(self.id, np.sum(self.sc_distr))
-            print(self.sc_distr)
-            raise HMTError('S children distribution probabilities do not sum to 1.')
-
-        # Calculate s distribution of daughter cells
-        if self.d0 is not None:
-            self.d0.s_distr = np.sum(self.sc_distr, axis=1)
-            # Continue recursion
-            if drec:
-                self.d0.calculate_s_distr(drec)
-        if self.d1 is not None:
-            self.d1.s_distr = np.sum(self.sc_distr, axis=0)
-            # Continue recursion
-            if drec:
-                self.d1.calculate_s_distr(drec)        
-
-
-    # Upward pass
-    def upward_pass(self, urec=False):
-        if urec:
-            # Recursion using post order tree traversal
-            if self.d0 is not None:
-                self.d0.upward_pass(urec)
-            if self.d1 is not None:
-                self.d1.upward_pass(urec)
-
-        if self.d0 is None and self.d1 is None:
-            self.beta_c_u = 1
-            return
-
-        self.beta_c = self.sc_distr.copy()
-        # print(self.beta_c)
-        if self.d0 is not None:
-            # Multiply columns
-            self.beta_c = (self.beta_c.T * self.tree.emit(self.d0.x)).T
-            self.beta_c = (self.beta_c.T * self.d0.beta_c_u).T
-        if self.d1 is not None:
-            # Multiply rows
-            self.beta_c *= self.tree.emit(self.d1.x)
-            self.beta_c *= self.d1.beta_c_u
-
-        N = np.sum(self.beta_c)
-        self.tree.loglikelihood += np.log(N)
-        self.beta_c = self.beta_c / N
-        ## Calculate beta_{c(u), u}
-        self.beta_c_u = self.tree.P * div0(self.beta_c, self.sc_distr)
-        # Sum over j and k
-        self.beta_c_u = np.sum(self.beta_c_u, axis=(1, 2))
-
-        if self.mother is None:
-            self.tree.loglikelihood += np.log(np.dot(
-                self.tree.emit(self.x),
-                self.s_distr * self.beta_c_u
-                ))
-
-
-    ## Downward Pass
-    def downward_pass(self, drec=False):
-        # alpha_c = div0(
-        #     (self.tree.P.T @ div0(self.xi, self.beta_c_u)).T,
-        #     self.sc_distr
-        # )
-        # self.xi_c = alpha_c * self.beta_c
-        if self.d0 is None and self.d1 is None:
-            return
-
-        if self.mother is None:
-            # Root node
-            self.xi_f = div0(self.beta_c, self.sc_distr) * self.tree.P
-            self.xi_f = (self.xi_f.T * self.tree.emit(self.x)).T
-            self.xi_f /= np.sum(self.xi_f)
-            
-            # Sum over i and j
-            self.xi = np.sum(self.xi_f, axis=(1, 2))
-        else:
-            self.xi_f = (self.tree.P.T * div0(self.xi, self.beta_c_u)).T
-            self.xi_f *= div0(self.beta_c, self.sc_distr)
-
-        # Quick check to see probabilities are the same
-        # print(np.allclose(self.xi - np.sum(self.xi_f, axis=(1, 2))))
-        self.xi_c = np.sum(self.xi_f, axis=0)
-        
-        if not np.isclose(np.sum(self.xi), 1):
-            print(self.id, np.sum(self.xi))
-            raise HMTError("Smoothed probabilities do not sum to 1")
-
-        if not np.isclose(np.sum(self.xi_c), 1):
-            print(self.id, np.sum(self.xi_c))
-            raise HMTError("Smoothed children probabilities do not sum to 1")
-
-        # Calculate xi values of daughter cells
-        if self.d0 is not None:
-            # Sum over k
-            self.d0.xi = np.sum(self.xi_c, axis=1)
-            # Continue recursion
-            if drec:
-                self.d0.downward_pass(drec)
-        if self.d1 is not None:
-            # Sum over j
-            self.d1.xi = np.sum(self.xi_c, axis=0)
-            # Continue recursion
-            if drec:
-                self.d1.downward_pass(drec)
-
-    
-    def extract_ml_s(self, drec=False):
-        if self.d0 is None and self.d1 is None:
-            return
-
-        if self.mother is None:
-            self.ml_s = np.argmax(self.xi)
-
-        ml_sc = np.unravel_index(np.argmax(self.xi_f[self.ml_s]), self.xi_c.shape)
-        if self.d0 is not None:
-            self.d0.ml_s = ml_sc[0]
-            # Continue recursion
-            if drec:
-                self.d0.extract_ml_s(drec)
-        if self.d1 is not None:
-            self.d1.ml_s = ml_sc[1]
-            # Continue recursion
-            if drec:
-                self.d1.extract_ml_s(drec)
-
-
-    def n_accurate_nodes(self):
-        if self.s is None:
-            raise HMTError("Cannot calculate accuracy without true values of s.")
-        accuracy = int(self.ml_s == self.s)
-        if self.d0 is not None:
-            accuracy += self.d0.n_accurate_nodes()
-        if self.d1 is not None:
-            accuracy += self.d1.n_accurate_nodes()
-        return accuracy
-
-
-    def sample(self, N, p, other=None):
-        if N == 1:
-            self.tree.leaves.append(self)
-            if other is not None:
-                other.tree.leaves.append(other)
-            return
-        # Randomly choose daughter to drop
-        q0 = np.random.choice((0, 0.5, 1), p=(p/2, 1 - p, p/2))
-        # print(q0)
-        N0 = normal_round(q0 * (N - 1))
-        N1 = N - 1 - N0
-        # print(f"{self.id = }, {N = }, {N0 = }, {N1 = }")
-        
-        if self.tree.sister_dep:
-            c_distr = self.tree.P[self.s]
-            s0, s1  = np.unravel_index(
-                np.random.choice(np.arange(self.tree.n_hidden ** 2), 1, p=c_distr.flatten())[0],
-                c_distr.shape
-                )
-        else:
-            curr_distr = self.tree.P[self.s]
-            s0, s1 = np.random.choice(np.arange(self.tree.n_hidden), 2, p=curr_distr, replace=True)
-
-        if N0 != 0:
-            # print(N0)
-            x0 = np.squeeze(np.random.multivariate_normal(self.tree.mus[s0], self.tree.sigmas[s0], 1))
-            if self.tree.n_obs == 1:
-                x0 = float(x0)
-            d0 = SDHMNode(self.id * 2, observed=x0, tree=self.tree, s=s0)
-            d0.mother = self
-            d0._path = self._path + '0'
-            self.d0 = d0
-            if other is None:
-                self.d0.sample(N0, p)
-            else:
-                otherd0 = HMNode(self.id * 2, observed=x0, tree=other.tree, s=s0)
-                otherd0.mother = other
-                otherd0._path = other._path + '0'
-                other.d0 = otherd0
-                self.d0.sample(N0, p, other.d0)
-
-        if N1 != 0:
-            x1 = np.squeeze(np.random.multivariate_normal(self.tree.mus[s1], self.tree.sigmas[s1], 1))
-            if self.tree.n_obs == 1:
-                x1 = float(x1)
-            d1 = SDHMNode(self.id * 2 + 1, observed=x1, tree=self.tree, s=s1)
-            d1.mother = self
-            d1._path = self._path + '1'
-            self.d1 = d1
-            if other is None:
-                self.d1.sample(N1, p)
-            else:
-                otherd1 = HMNode(self.id * 2, observed=x1, tree=other.tree, s=s1)
-                otherd1.mother = other
-                otherd1._path = other._path + '1'
-                other.d1 = otherd1
-                
-                self.d1.sample(N1, p, other.d1)
 
 
 class HMTree(Tree, HMModel):
