@@ -150,7 +150,7 @@ class Node():
                 total = 1.0 * attr
             else:
                 total = func(attr)
-        elif isinstance(attrs, tuple):
+        elif isinstance(attrs, tuple) or isinstance(attrs, list):
             attr_list = [getattr(self, attr) for attr in attrs]
             
             if func is None:
@@ -172,6 +172,15 @@ class Node():
         #     return 0
 
         return total
+    
+
+    def max(self, attr):
+        x = getattr(self, attr)
+        if self.d0 is not None:
+            x = max(x, self.d0.max(attr))
+        if self.d1 is not None:
+            x = max(x, self.d1.max(attr))
+        return x
 
 
     def apply(self, func, attr, drec=False):
@@ -317,7 +326,12 @@ class Tree():
 
     def sum(self, attrs, func=None):
         return self.root.sum(attrs, func)
+    
 
+    def sum_where(self, attr_to_sum, cond_attr, cond):
+        nodes = self.where(cond_attr, cond)
+        return np.sum([getattr(node, attr_to_sum) for node in nodes], axis=0)
+    
 
     def mean(self, attr='x'):
         return self.sum(attr) / self.xlen(attr)
@@ -326,6 +340,18 @@ class Tree():
     def var(self, attr='x'):
         mean = self.mean(attr)
         return self.sum(attr, func=lambda x: (x - mean) ** 2) / (self.xlen(attr) - 1)
+    
+
+    def cov(self, attr='x'):
+        mean = self.mean(attr)
+        cov = self.sum(
+            attr,
+            func = lambda x: np.outer(x - mean, x - mean)
+        )
+        cov = np.squeeze(cov / (len(self) - 1))
+        if cov.ndim == 0:
+            return float(cov)
+        return cov
 
 
     def apply(self, func, attr):
@@ -344,6 +370,32 @@ class Tree():
         sd = np.sqrt(var)
         self.apply(lambda x: (x - mean) / sd, attr)
         return mean, sd
+
+
+    def to_numpy(self):
+        """
+        Currently only works for data that is numbered root = 1
+        and for node n, d0 has id 2 * n and d1 has id 2 * n + 1
+        """
+        queue = [self.root]
+        X = []
+        while len(queue) > 0:
+            node = queue.pop(0)
+            # if node.mother is None:
+            #     mother_id = node.id
+            # else:
+            #     mother_id = node.mother.id
+            
+            # if isinstance(node.x, np.ndarray):
+            #     X.append((node.id, mother_id, *node.x))
+            # else:
+            #     X.append((node.id, mother_id, node.x))
+            X.append(node.x)
+            if node.d0 is not None:
+                queue.append(node.d0)                
+            if node.d1 is not None:
+                queue.append(node.d1)
+        return np.array(X)
 
 
 class Forest:
@@ -368,6 +420,10 @@ class Forest:
         Returns the sum over all trees of attributes after appling func to them
         """
         return np.sum([tree.sum(attrs, func) for tree in self.trees], axis=0)
+    
+
+    def sum_where(self, attr_to_sum, cond_attr, cond):
+        return np.sum([tree.sum_where(attr_to_sum, cond_attr, cond) for tree in self.trees], axis=0)
     
 
     def remove_where(self, cond):
@@ -399,6 +455,11 @@ class Forest:
         sd = np.sqrt(var)
         self.apply(lambda x: (x - mean) / sd, attr)
         return mean, sd
+    
+
+    def permute_attr(self, attr_str, perm):
+        attr = getattr(self, attr_str)
+        setattr(self, attr_str, attr[perm])
 
     
     def read_txt(self, filepath, sep="\t", agg_func=None):
@@ -468,6 +529,19 @@ class Forest:
         self.trees.append(curr_tree)
 
 
+    def to_numpy(self):
+        if isinstance(self.trees[0].root.x, np.ndarray):
+            X = np.full((1, self.trees[0].root.x.shape[0]), np.nan)
+        else:
+            X = np.full((1, 1), np.nan)
+        for tree in self.trees:
+            treeX = tree.to_numpy()
+
+            X = np.row_stack((X, treeX))
+        X = X[~np.isnan(X).all(axis=1)]
+        return X
+
+
 def read_txt(filepath, sep='\t', agg_func=None, model_type="HMT"):
     # Determine type of tree to read data into
     if model_type == "HMT":
@@ -478,4 +552,3 @@ def read_txt(filepath, sep='\t', agg_func=None, model_type="HMT"):
         raise HMTError("Only supported model types are 'HMT' and 'Kalman'")
     forest.read_txt(filepath, sep, agg_func)
     return forest
-    
