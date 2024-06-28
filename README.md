@@ -41,5 +41,5 @@ To get started:
 1. Run the main app:
 
    ```bash
-   python -m hidden_markov_trees
+   python -m hmt
    ```
