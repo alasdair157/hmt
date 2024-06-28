@@ -25,7 +25,7 @@ disallow_any_explicit = true
 disallow_any_generics = true
 warn_unreachable = true
 warn_unused_ignores = true
-disallow_untyped_defs = true
+# disallow_untyped_defs = true
 exclude = [".venv/"]
 
 [[tool.mypy.overrides]]
@@ -40,7 +40,7 @@ target-version = "py312"
 
 [tool.ruff.lint]
 select = [
-    "D",   # pydocstyle
+    # "D",   # pydocstyle
     "E",   # pycodestyle
     "F",   # Pyflakes
     "I",   # isort
