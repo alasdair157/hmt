@@ -1,86 +1,84 @@
-"""
-Implementation of base Tree and Node class.
-"""
+"""Implementation of base Tree and Node class."""
+
+import warnings
+
+import numpy as np
+
 import hmt
 from hmt.exceptions import HMTError, HMTWarning
 from hmt.utils import insort
-import numpy as np
-from collections import defaultdict
-from typing import Callable
-import warnings
 
 
-class Node():
-    """
-    Attributes
+class Node:
+    """Attributes:
     ----------
-
     _path: str
-        Binary representation of where the node is on the tree, 0 => left and 1 => right.
-        e.g. 
+        Binary representation of where the node is on the tree
+        0 => left and 1 => right. e.g.
                1      1 = 0     4 = 000
              /   \    2 = 00    5 = 001
             2     3   3 = 01    6 = 010
            / \   /
           4   5 6
     """
+
     def __init__(self, node_id, observed=None, tree=None):
         self.id = node_id
         self.x = observed
         self.tree = tree
-        self._path = ''
+        self._path = ""
         self.mother = None
         self.d0 = None
         self.d1 = None
 
-
     def __len__(self):
         n_nodes = 1
         if self.d0 is not None:
-            n_nodes += len(self.d0) 
+            n_nodes += len(self.d0)
         if self.d1 is not None:
             n_nodes += len(self.d1)
         return n_nodes
-    
 
     def __lt__(self, other):
         return self._path < other._path
 
-
     def __repr__(self):
         if self.x is None:
-            return f'Node({self.id})'
+            return f"Node({self.id})"
         if isinstance(self.x, float):
-            return f'Node({self.id}, x={round(self.x, 1)})'
-        return f'Node({self.id}, x={self.x})'
+            return f"Node({self.id}, x={round(self.x, 1)})"
+        return f"Node({self.id}, x={self.x})"
 
-
-    def printTree(self, level=0, attr_name=None, arrow='\u2B62 ', max_level=None):
+    def printTree(self, level=0, attr_name=None, arrow="\u2b62 ", max_level=None):
         if max_level is not None and level == max_level:
             return
         if self.d1 is not None:
-            self.d1.printTree(level + 1, attr_name, arrow='\u2BA3 ', max_level=max_level)
+            self.d1.printTree(
+                level + 1, attr_name, arrow="\u2ba3 ", max_level=max_level
+            )
         if attr_name is not None:
             attr = getattr(self, attr_name)
-            
+
             if isinstance(attr, float):
                 attr = round(attr, 2)
             strlen = len(str(attr))
             if isinstance(attr, np.ndarray):
                 strlen = 2 + attr.shape[0] * 5
-            
+
             with np.printoptions(precision=2, suppress=True):
                 print(
-                    ' ' * (11 + strlen + len(attr_name)) * level + arrow + 
-                    f'{self.id} ({attr_name} = {attr})'
-                    )
+                    " " * (11 + strlen + len(attr_name)) * level
+                    + arrow
+                    + f"{self.id} ({attr_name} = {attr})"
+                )
         else:
-            print(' ' * 5 * level + arrow + str(self.id))
+            print(" " * 5 * level + arrow + str(self.id))
         if self.d0 is not None:
-            self.d0.printTree(level + 1, attr_name, arrow='\u2BA1 ', max_level=max_level)
-    
+            self.d0.printTree(
+                level + 1, attr_name, arrow="\u2ba1 ", max_level=max_level
+            )
 
-    def xlen(self, attr_name='x'):
+    def xlen(self, attr_name="x"):
         """Returns the number of nodes for which attr is not nan"""
         attr = getattr(self, attr_name)
 
@@ -94,14 +92,12 @@ class Node():
             num += self.d1.xlen(attr_name)
         return num
 
-
     def set_tree(self, tree):
         self.tree = tree
         if self.d0 is not None:
             self.d0.set_tree(tree)
         if self.d1 is not None:
             self.d1.set_tree(tree)
-
 
     def leaves(self):
         if self.d0 is not None and self.d1 is not None:
@@ -113,7 +109,6 @@ class Node():
         if self.d1 is not None:
             return self.d1.leaves()
         return [self]
-
 
     def find(self, node_id):
         # if node_id == 9:
@@ -128,7 +123,6 @@ class Node():
             right = self.d1.find(node_id)
             if right is not None:
                 return right
-    
 
     def where(self, attr, cond):
         nodes = []
@@ -139,7 +133,6 @@ class Node():
         if self.d1 is not None:
             nodes += self.d1.where(attr, cond)
         return nodes
-
 
     def sum(self, attrs, func=None):
         if isinstance(attrs, str):
@@ -152,7 +145,7 @@ class Node():
                 total = func(attr)
         elif isinstance(attrs, tuple) or isinstance(attrs, list):
             attr_list = [getattr(self, attr) for attr in attrs]
-            
+
             if func is None:
                 total = sum(attr_list)
             else:
@@ -172,7 +165,6 @@ class Node():
         #     return 0
 
         return total
-    
 
     def max(self, attr):
         x = getattr(self, attr)
@@ -182,7 +174,6 @@ class Node():
             x = max(x, self.d1.max(attr))
         return x
 
-
     def apply(self, func, attr, drec=False):
         # Update the attribute to be the attribute with the function applied
         setattr(self, attr, func(getattr(self, attr)))
@@ -191,12 +182,11 @@ class Node():
                 self.d0.apply(func, attr, drec)
             if self.d1 is not None:
                 self.d1.apply(func, attr, drec)
-    
 
     def astype(self, nodeclass):
         new_node = nodeclass()
-        old_dict = self.__dict__
-        new_dict = new_node.__dict__
+        old_dict = self.__dict__  # noqa F841
+        new_dict = new_node.__dict__  # noqa F841
 
         if self.mother is not None:
             if int(self.path[-1]):
@@ -204,14 +194,14 @@ class Node():
                 self.mother.d1 = new_node
             else:
                 self.mother.d0 = new_node
-        
+
         if self.d0 is not None:
             new_node.d0.astype(nodeclass)
         if self.d1 is not None:
             new_node.d1.astype(nodeclass)
-        
 
-class Tree():
+
+class Tree:
     def __init__(self, root=None):
         if root is not None:
             self.root = root
@@ -221,39 +211,32 @@ class Tree():
             self.root = None
             self.leaves = []
 
-
     def __str__(self):
         if self.root is not None:
             self.root.printTree()
-            return('')
-        return("Tree()")
-
+            return ""
+        return "Tree()"
 
     def __len__(self):
         return len(self.root)
 
-
-    def xlen(self, attr='x'):
+    def xlen(self, attr="x"):
         return self.root.xlen(attr)
-
 
     def show(self, attr_name=None, max_level=None):
         self.root.printTree(attr_name=attr_name, max_level=max_level)
 
-
     def get_node(self, node_id):
         node = self.root.find(node_id)
         if node is None:
-            raise HMTError(f'Node {node_id} not found.')
+            raise HMTError(f"Node {node_id} not found.")
         return node
-
 
     def get_leaf(self, node_id):
         for node in self.leaves:
             if node.id == node_id:
                 return node
-        raise HMTError(f'Node {node_id} not found in self.leaves.')
-
+        raise HMTError(f"Node {node_id} not found in self.leaves.")
 
     def add_node(self, node, mother_id):
         # If this is the first node
@@ -267,16 +250,18 @@ class Tree():
         try:
             mother_node = self.get_node(mother_id)
         except HMTError:
-            raise HMTError(f'Mother node (node {mother_id}) not found while adding node {node.id}.') from None
-        
+            raise HMTError(
+                f"Mother node (node {mother_id}) not found while adding node {node.id}."
+            ) from None
+
         node.set_tree(self)
 
         if mother_node.d0 is None:
             mother_node.d0 = node
-            node._path = mother_node._path + '0'
+            node._path = mother_node._path + "0"
         elif mother_node.d1 is None:
             mother_node.d1 = node
-            node._path = mother_node._path + '1'
+            node._path = mother_node._path + "1"
         else:
             raise HMTError(f"Mother node (node {mother_id}) already has two children.")
 
@@ -286,12 +271,10 @@ class Tree():
             self.leaves.remove(mother_node)
         for leaf in node.leaves():
             insort(self.leaves, leaf)
-    
 
     def update_node(self, node_id, observed):
         node = self.get_node(node_id)
         node.x = observed
-    
 
     def remove(self, node):
         if int(node._path[-1]):
@@ -305,76 +288,63 @@ class Tree():
 
         if node in self.leaves:
             self.leaves.remove(node)
-        
-        if node.d0 is not None or node.d1 is not None:
-            warnings.warn(f"Node {node.id} removed with children: [{node.d0}, {node.d1}]", HMTWarning)
 
+        if node.d0 is not None or node.d1 is not None:
+            warnings.warn(
+                f"Node {node.id} removed with children: [{node.d0}, {node.d1}]",
+                HMTWarning,
+            )
 
     def remove_node(self, node_id):
         node = self.get_node(node_id)
         self.remove(node)
-    
 
     def where(self, attr, cond):
         return self.root.where(attr, cond)
 
-    
     def remove_where(self, attr, cond):
         for node in self.where(attr, cond):
             self.remove(node)
-    
 
     def sum(self, attrs, func=None):
         return self.root.sum(attrs, func)
-    
 
     def sum_where(self, attr_to_sum, cond_attr, cond):
         nodes = self.where(cond_attr, cond)
         return np.sum([getattr(node, attr_to_sum) for node in nodes], axis=0)
-    
 
-    def mean(self, attr='x'):
+    def mean(self, attr="x"):
         return self.sum(attr) / self.xlen(attr)
 
-
-    def var(self, attr='x'):
+    def var(self, attr="x"):
         mean = self.mean(attr)
         return self.sum(attr, func=lambda x: (x - mean) ** 2) / (self.xlen(attr) - 1)
-    
 
-    def cov(self, attr='x'):
+    def cov(self, attr="x"):
         mean = self.mean(attr)
-        cov = self.sum(
-            attr,
-            func = lambda x: np.outer(x - mean, x - mean)
-        )
+        cov = self.sum(attr, func=lambda x: np.outer(x - mean, x - mean))
         cov = np.squeeze(cov / (len(self) - 1))
         if cov.ndim == 0:
             return float(cov)
         return cov
 
-
     def apply(self, func, attr):
         """Recursively applies the function func to attr of all nodes."""
         self.root.apply(func, attr, drec=True)
-    
 
     def permute_attr(self, attr_str, perm):
         attr = getattr(self, attr_str)
         setattr(self, attr_str, attr[perm])
-    
 
-    def normalise(self, attr='x'):
+    def normalise(self, attr="x"):
         mean = self.mean(attr)
         var = self.var(attr)
         sd = np.sqrt(var)
         self.apply(lambda x: (x - mean) / sd, attr)
         return mean, sd
 
-
     def to_numpy(self):
-        """
-        Currently only works for data that is numbered root = 1
+        """Currently only works for data that is numbered root = 1
         and for node n, d0 has id 2 * n and d1 has id 2 * n + 1
         """
         queue = [self.root]
@@ -385,14 +355,14 @@ class Tree():
             #     mother_id = node.id
             # else:
             #     mother_id = node.mother.id
-            
+
             # if isinstance(node.x, np.ndarray):
             #     X.append((node.id, mother_id, *node.x))
             # else:
             #     X.append((node.id, mother_id, node.x))
             X.append(node.x)
             if node.d0 is not None:
-                queue.append(node.d0)                
+                queue.append(node.d0)
             if node.d1 is not None:
                 queue.append(node.d1)
         return np.array(X)
@@ -405,26 +375,22 @@ class Forest:
         self.tree_kwargs = tree_kwargs
         self.node_kwargs = node_kwargs
         self.trees = []
-    
 
     def __len__(self):
         return len(self.trees)
-    
 
-    def xlen(self, attr='x'):
+    def xlen(self, attr="x"):
         return np.sum([tree.xlen(attr) for tree in self.trees], axis=0)
-    
 
     def sum(self, attrs, func=None):
-        """
-        Returns the sum over all trees of attributes after appling func to them
-        """
+        """Returns the sum over all trees of attributes after appling func to them"""
         return np.sum([tree.sum(attrs, func) for tree in self.trees], axis=0)
-    
 
     def sum_where(self, attr_to_sum, cond_attr, cond):
-        return np.sum([tree.sum_where(attr_to_sum, cond_attr, cond) for tree in self.trees], axis=0)
-    
+        return np.sum(
+            [tree.sum_where(attr_to_sum, cond_attr, cond) for tree in self.trees],
+            axis=0,
+        )
 
     def remove_where(self, cond):
         to_remove = []
@@ -433,43 +399,37 @@ class Forest:
                 to_remove.append(tree)
         for tree in to_remove:
             self.trees.remove(tree)
-    
 
     def apply(self, func, attr):
         for tree in self.trees:
             tree.apply(func, attr)
-    
 
-    def mean(self, attr='x'):
+    def mean(self, attr="x"):
         return self.sum(attr) / self.xlen(attr)
 
-
-    def var(self, attr='x'):
+    def var(self, attr="x"):
         mean = self.mean(attr)
         return self.sum(attr, func=lambda x: (x - mean) ** 2) / (self.xlen(attr) - 1)
 
-
-    def normalise(self, attr='x'):
+    def normalise(self, attr="x"):
         mean = self.mean(attr)
         var = self.var(attr)
         sd = np.sqrt(var)
         self.apply(lambda x: (x - mean) / sd, attr)
         return mean, sd
-    
 
     def permute_attr(self, attr_str, perm):
         attr = getattr(self, attr_str)
         setattr(self, attr_str, attr[perm])
 
-    
     def read_txt(self, filepath, sep="\t", agg_func=None):
         # Read file
-        with open(filepath, 'r') as f:
+        with open(filepath) as f:
             lines = f.readlines()
 
         # Ensure file ends in empty line
-        if lines[-1] and lines[-1][-1] != '\n':
-            lines[-1] += '\n'
+        if lines[-1] and lines[-1][-1] != "\n":
+            lines[-1] += "\n"
         # Format data into array
         lines = [[x for x in line[:-1].split(sep)] for line in lines]
 
@@ -486,7 +446,7 @@ class Forest:
 
                 # Create new tree
                 curr_tree = self.TreeClass(**self.tree_kwargs)
-            
+
             # if curr_tree is None:
             #     ## Data doesn't start with a root
             #     # Create empty root
@@ -523,11 +483,12 @@ class Forest:
             if not added:
                 missing.append(int(line[0]))
         if missing:
-            warnings.warn(f"Nodes {missing} could not be added to any trees.", HMTWarning)
-        
+            warnings.warn(
+                f"Nodes {missing} could not be added to any trees.", HMTWarning
+            )
+
         # Finally add the last tree created
         self.trees.append(curr_tree)
-
 
     def to_numpy(self):
         if isinstance(self.trees[0].root.x, np.ndarray):
@@ -542,7 +503,7 @@ class Forest:
         return X
 
 
-def read_txt(filepath, sep='\t', agg_func=None, model_type="HMT"):
+def read_txt(filepath, sep="\t", agg_func=None, model_type="HMT"):
     # Determine type of tree to read data into
     if model_type == "HMT":
         forest = hmt.HMForest()
