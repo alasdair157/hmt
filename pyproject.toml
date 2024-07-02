@@ -1,0 +1,56 @@
+[tool.poetry]
+name = "hmt"
+version = "0.1.0"
+description = "An implementation of Hidden Markov Trees (HMT) in Python."
+authors = ["Alasdair Daniels <alasdair.daniels19@imperial.ac.uk>"]
+
+[tool.poetry.dependencies]
+python = "^3.12"
+numpy = "<2.0.0"
+
+[tool.poetry.dev-dependencies]
+pytest = "^8.2"
+pytest-cov = "^5.0.0"
+pytest-mypy = "^0.10.0"
+pytest-mock = "^3.7.0"
+pre-commit = "^3.0.4"
+ruff = "^0.4.4"
+
+[build-system]
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.mypy]
+disallow_any_explicit = true
+disallow_any_generics = true
+warn_unreachable = true
+warn_unused_ignores = true
+# disallow_untyped_defs = true
+exclude = [".venv/"]
+
+[[tool.mypy.overrides]]
+module = "tests.*"
+disallow_untyped_defs = false
+
+[tool.pytest.ini_options]
+addopts = "-v --mypy -p no:warnings --cov=hmt --cov-report=html --doctest-modules --ignore=hmt/__main__.py"
+
+[tool.ruff]
+target-version = "py312"
+
+[tool.ruff.lint]
+select = [
+    # "D",   # pydocstyle
+    "E",   # pycodestyle
+    "F",   # Pyflakes
+    "I",   # isort
+    "UP",  # pyupgrade
+    "RUF", # ruff
+]
+pydocstyle.convention = "google"
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = [
+    "D100",
+    "D104",
+] # Missing docstring in public module, Missing docstring in public package
