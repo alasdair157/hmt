@@ -2,6 +2,7 @@
 Exension of numpy to do useful things
 """
 import numpy as np
+from hmt.exceptions import HMTError
 
 
 def insort(a, x):
@@ -72,7 +73,9 @@ def mutual_information(P):
 
 
 def ppmcc(P):
-    """Calculates the mutual information between """
+    """Calculates the correlation between """
+    if P.shape[0] != 2:
+        raise HMTError()
     r = np.zeros(P.shape[0])
     states = np.arange(1, P.shape[0] + 1)
     for i, Pi in enumerate(P):
@@ -135,9 +138,10 @@ def digamma(x):
     """
     if not isinstance(x, np.ndarray):
         return float_digamma(x)
-    x_ = x.copy()
+    x_ = x.copy().astype(float)
     # print(x_)
     r = np.zeros_like(x_)
+    # assert False, "I want to stop here"
     while (x_ <= 5).any():
         r[x_ <= 5] -= 1 / x_[x_ <= 5]
         x_[x_ <= 5] += 1
@@ -145,3 +149,50 @@ def digamma(x):
     t = f * (-1 / 12.0 + f * (1 / 120.0 + f * (-1 / 252.0 + f * (1 / 240.0 + f * (-1 / 132.0
         + f * (691 / 32760.0 + f * (-1 / 12.0 + f * 3617 / 8160.0)))))))
     return r + np.log(x_) - 0.5 / x_ + t
+
+
+def dirichlet_variance(weights):
+    """
+    Calculates the varaiance of each weight in a Dirichlet distribution. Note
+    this function takes in a matrix or array of weights for a *single* Dirichlet
+    distribution
+    """
+    weight_sum = weights.sum()
+    norm_weights = (weights / weight_sum).flatten()
+    return norm_weights * (1 - norm_weights) / (weight_sum + 1)
+
+
+def lognormal_covariance(log_mus, log_cov):
+    """
+    Calculates the covariance of the lognormal distribution given the covariance of the normal distribution
+    in log space.
+    """
+    n_hidden, n_obs = log_mus.shape
+    cov = np.exp(log_cov.copy()) - 1
+    n_hidden, n_obs = 2, 3
+    for i in range(n_hidden):
+        for j in range(n_obs):
+            for k in range(n_obs):
+                cov[i, j, k] *= np.exp(log_mus[i, j] + log_mus[i, k] + (log_cov[i, j, j] + log_cov[i, k, k]) / 2)
+    return cov
+
+
+def cov2corr(cov):
+    """
+    Calculate the correlation matrix from a covariance matrix
+    """
+    sds = np.sqrt(np.diagonal(cov, axis1=1, axis2=2))
+    return cov / rowwise_outer(sds, sds)
+
+def log_addition(x, y):
+    return np.log(np.exp(x) + np.exp(y))
+
+def log_subtraction(x, y):
+    return np.log(np.exp(x) - np.exp(y))
+
+def is_iterable(obj):
+    try:
+        iter(obj)
+    except: 
+        return False
+    return True

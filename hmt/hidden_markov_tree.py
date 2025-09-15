@@ -3,223 +3,18 @@ Implementation of Hidden Markov Trees (HMTree and HMNode classes).
 """
 
 import numpy as np
+import pandas as pd
 from timeit import default_timer
 from itertools import permutations
+from collections import defaultdict
+import warnings
 
 from hmt.core import Node, Tree, Forest
 from hmt.exceptions import HMTError
-from hmt.utils import div0, rowwise_outer, mvn_pdf, normal_round, digamma
+from hmt.utils import div0, rowwise_outer, normal_round, digamma
+import hmt.emissions as emissions
 
-
-class HMModel:
-    """
-    Base class for parameter methods for hidden Markov trees. Used to implement
-    basic checks when setting parameters
-    
-    Methods
-    -------
-    init_params()
-        Initialises parameters
-    check_params()
-        Checks parameters and raises exceptions if there are problems with any
-    set_params()
-        Sets parameters specified in arguments
-    get_params()
-        Returns dictionary with current parameters
-    clear_params()
-        Sets all parameters to None
-    """
-    def __init__(self):
-        pass
-
-
-    def init_params(self):
-        if self.init_s_distr is None:
-            # Randomly initialise initial distribution
-            self.init_s_distr = np.random.uniform(0, 1, self.n_hidden)
-            # Normalise
-            self.init_s_distr /= np.sum(self.init_s_distr)
-
-        if self.P is None:
-            # Randomly initialise transistion matrix
-            if self.sister_dep:
-                self.P = np.random.uniform(0, 1, (self.n_hidden, self.n_hidden, self.n_hidden))
-                # Normalise for each value of i
-                self.P = (self.P.T / np.sum(self.P, axis=(1, 2))).T
-                # self.P = np.full((self.n_hidden, self.n_hidden, self.n_hidden), 1 / self.n_hidden ** 2)
-                if not self.daughter_order:
-                    self.P = (self.P + np.transpose(self.P, axes=(0, 2, 1))) / 2
-            else:
-                self.P = np.random.uniform(0, 1, (self.n_hidden, self.n_hidden))
-                # Normalise for each value of i
-                self.P = (self.P.T / np.sum(self.P, axis=1)).T
-
-        if self.mus is None:
-            # Randomly initialise r means of size n
-            self.mus = np.random.randn(self.n_hidden, self.n_obs)
-        if self.sigmas is None:
-            # Initialise sigma based on variance in the data NOTE useless if normalising first
-            var = self.var()
-            if not isinstance(var, np.ndarray):
-                var = np.array([var])
-            self.sigmas = np.stack([np.diag(var) for _ in range(self.n_hidden)])
-            # Ensure positive definite
-            # self.sigmas = self.sigmas @ np.transpose(self.sigmas, axes=(0, 2, 1))
-
-            if (np.linalg.eigvals(self.sigmas) <= 0).any():
-                raise HMTError("Initial sigma should be positive definite")
-            if not np.allclose(self.sigmas, np.transpose(self.sigmas, axes=(0, 2, 1))):
-                raise HMTError("Initial sigma should be symmetric")
-
-            self.sigmainv = np.linalg.inv(self.sigmas)
-            self.detsigma = np.linalg.det(self.sigmas)
-
-
-    def check_params(self, init_s_distr=None, P=None, emit_mat=None, mus=None, sigmas=None):
-        if init_s_distr is not None:
-            if init_s_distr.shape[0] != self.n_hidden:
-                raise HMTError("Initial distribution must be defined for all s values")
-            if not np.isclose(sum(init_s_distr), 1):
-                raise HMTError('init_s_distr must be a probability distribution.')
-
-        if P is not None:
-            if P.shape[0] != self.n_hidden:
-                raise HMTError('P must be rxr or rxrxr where r is the number of hidden states.')
-            if P.ndim == 2:
-                if not np.allclose(P.sum(axis=1), 1):
-                    raise HMTError('Rows of P must sum to 1.')
-                if P.shape[0] != P.shape[1]:
-                    raise HMTError('P must be a square matrix.')
-                if P.shape[0] != init_s_distr.shape[0]:
-                    raise HMTError('P must have the number of columns as init_s_distr.')
-            if P.ndim == 3:
-                # Sister dependence
-                if P.shape[0] != P.shape[1] or P.shape[0] != P.shape[2]:
-                    raise HMTError('P must be a cube.')
-                if not np.allclose(P.sum(axis=(1, 2)), 1):
-                    raise HMTError('Matrices in of P must sum to 1.')
-
-        if emit_mat is not None:
-            if not np.allclose(emit_mat.sum(axis=1), 1):
-                raise HMTError('Rows of emit must sum to 1.')
-            if emit_mat.shape[0] != P.shape[0]:
-                raise HMTError('Emit must have the same number of rows as P')
-        
-        if mus is not None:
-            
-            if mus.shape[0] != self.n_hidden:
-                raise HMTError("mu must have shape rxn where r is the number of hidden states and n is the number of observed states")
-            
-            # TODO check when nobs is 1D
-            if self.n_obs > 1 and mus.shape[1] != self.n_obs:    
-                raise HMTError("mu must have shape rxn where r is the number of hidden states and n is the number of observed states")
-            
-
-        if sigmas is not None:
-            if sigmas.shape[0] != self.n_hidden:
-                raise HMTError("Emission covaraince matrix must have shape rxnxn where r is the number of hidden states and n is the number of observed states")
-            if not (np.linalg.eigvals(sigmas) > 0).all():
-                raise HMTError("Sigma should be positive definite")
-
-            if not np.allclose(sigmas, np.transpose(sigmas, axes=(0, 2, 1))):
-                raise HMTError("Sigma should be symmetric")
-            # TODO check when nobs is 1D
-            # if sigmas.ndim != 3: 
-            #     raise HMTError("Emission covaraince tensor must be 3d, i.e. r 2d covariance matrices where r is the number of hidden states")
-            
-            # if sigmas.shape[1] != self.n_obs or sigmas.shape[2] != self.n_obs:
-            #     raise HMTError("Emission covaraince matrix must have shape rxnxn where r is the number of hidden states and n is the number of observed states")
-
-
-    def set_params(self, init_s_distr=None, P=None, emit_mat=None, mus=None,
-                         sigmas=None, sigmainv=None, detsigma=None, sister_dep=None, daughter_order=None,
-                         check_params=True):
-        if sister_dep is not None:
-            self.sister_dep = sister_dep
-        
-        if sister_dep is not None:
-            self.daughter_order = daughter_order
-        
-        if check_params:
-            self.check_params(init_s_distr, P, emit_mat, mus, sigmas)
-
-        if init_s_distr is not None:
-            self.init_s_distr = init_s_distr.copy()
-
-        if P is not None:
-            self.P = P.copy()
-
-        if emit_mat is not None:
-            self.emit_mat = emit_mat.copy()
-
-        if mus is not None:
-            self.mus = mus.copy()
-
-        if sigmas is not None:
-            self.sigmas = sigmas.copy()
-
-        if sigmainv is None:
-            if self.sigmas is not None:
-                self.sigmainv = np.linalg.inv(self.sigmas)
-            else:
-                self.sigmainv = None
-        else:
-            self.sigmainv = sigmainv.copy()
-        if detsigma is None:
-            if self.sigmas is not None:
-                self.detsigma = np.linalg.det(self.sigmas)
-            else:
-                self.detsigma = None
-        else:
-            self.detsigma = detsigma.copy()
-    
-
-    def get_params(self):
-        return {
-            'init_s_distr': self.init_s_distr,
-            'P': self.P,
-            'mus': self.mus,
-            'sigmas': self.sigmas,
-            'sister_dep': self.sister_dep,
-            'daughter_order': self.daughter_order
-        }
-    
-
-    def clear_params(self):
-        self.init_s_distr = None
-        self.P = None
-        self.mus = None
-        self.sigmas = None
-        self.sigmainv = None
-        self.detsigma = None
-    
-
-    def permute(self):
-        """
-        Takes permutation of *true* hidden states and uses the inverse of that
-        to permute the predicted states and parameters
-        """
-        best_acc, perm = self.best_permutation()
-        if perm is None:
-            return best_acc
-        perm = list(perm)
-
-        # Permute ml_s
-        self.permute_ml_s(perm)
-
-        # Permute parameters
-        params = [
-            'mus', 'sigmas', 'sigmainv', 'detsigma', 'init_s_distr'
-            ]
-        for attr in params:
-            self.permute_attr(attr, perm)
-
-        # Permute P (permute in all dimensions in order)
-        self.P = self.P[perm][:, perm]
-        if self.P.ndim == 3:
-            self.P = self.P[:, :, perm]
-        return best_acc
-
+# logging.basicConfig(level=logging.ERROR, format="hmt %(levelname)s: %(message)s")
 
 class HMNode(Node):
     """
@@ -281,9 +76,10 @@ class HMNode(Node):
     [1]
     [2] Me :)
     """
-    def __init__(self, node_id, observed, tree=None, s=None):
-        super().__init__(node_id, observed, tree)
-        self.s = s
+    def __init__(self, node_id, observed, hmmodel=None, c=None, d=None, t=None, hidden_state=None):
+        super().__init__(node_id, observed)
+        self.hmmodel = hmmodel
+        self.s, self.c, self.d, self.t = hidden_state, c, d, t
         self.ml_s = None
 
         self.s_distr = None
@@ -301,8 +97,13 @@ class HMNode(Node):
         self.beta_c_u = None
         self.xi_c = None
         self.xi_f = None
-        
-    
+
+        # Switches during cell life
+        self.next = None
+        self.prev = None
+
+        self.Ex = np.empty((self.hmmodel.n_hidden, self.hmmodel.n_obs))
+
 
     def __repr__(self):
         return f'HMNode({self.id})'
@@ -332,13 +133,12 @@ class HMNode(Node):
             self.d1.clean()
 
 
-
     # Initial downward pass
     def calculate_s_distr(self, drec=False):
         if self.mother is None and self.s_distr is None:
             raise HMTError('Root node has no initial S distribution.')
 
-        sc_distr = self.s_distr @ self.tree.P
+        sc_distr = self.s_distr @ self.hmmodel.P
         if not np.isclose(sum(sc_distr), 1):
             raise HMTError('S distribution probabilities do not sum to 1.')
         
@@ -363,22 +163,23 @@ class HMNode(Node):
             if self.d1 is not None:
                 self.d1.upward_pass(urec)
     
-        self.beta = self.tree.emit(self.x) * self.s_distr
+        self.beta = self.hmmodel.emission(self) * self.s_distr
         if self.d0 is not None:
             self.beta *= self.d0.m_d_beta
         if self.d1 is not None:
             self.beta *= self.d1.m_d_beta
         
         N = np.sum(self.beta)
-        self.tree.loglikelihood += np.log(N)
+        self.hmmodel.loglikelihood += np.log(N)
         
         # Normalise beta
         self.beta = self.beta / N
         if not np.isclose(sum(self.beta), 1):
             raise HMTError("Probabilities in beta don't sum to 1.")
+            # logging.info("Probabilities in beta don't sum to 1")
         
         # Calculate mother-daughter beta
-        self.m_d_beta = self.tree.P @ div0(self.beta, self.s_distr)
+        self.m_d_beta = self.hmmodel.P @ div0(self.beta, self.s_distr)
 
 
     ## Downward Pass
@@ -392,7 +193,7 @@ class HMNode(Node):
             row_mult = div0(self.beta, self.s_distr)
             col_mult = div0(self.mother.xi, self.m_d_beta)
 
-            self.m_d_xi = self.tree.P * row_mult
+            self.m_d_xi = self.hmmodel.P * row_mult
             self.m_d_xi = (self.m_d_xi.T * col_mult).T
         
             # print(np.linalg.norm(self.xi - self.m_d_xi.sum(axis=0))) 
@@ -403,10 +204,12 @@ class HMNode(Node):
         if not np.isclose(np.sum(self.xi), 1):
             print(f'Xi sum = {np.sum(self.xi)}')
             raise HMTError("Smoothed probabilities do not sum to 1.")
+            # logging.info("Smoothed probabilities do not sum to 1.\nXi sum = %s".format(np.sum(self.xi)))
         
         if self.mother is not None and not np.isclose(np.sum(self.m_d_xi), 1):
             print(f'Xi sum = {np.sum(self.m_d_xi)}')
             raise HMTError("Smoothed probabilities do not sum to 1.")
+            # logging.info("Smoothed probabilities do not sum to 1.")
         
         # Continue recursion
         if drec:
@@ -417,7 +220,7 @@ class HMNode(Node):
     
 
     def mother_xi_sum(self):
-        if self.mother is None:
+        if self.mother is None or self.prev is not None:
             total = 0
         else:
             total = self.mother.xi.copy()
@@ -437,14 +240,14 @@ class HMNode(Node):
             if self.d1 is not None:
                 self.d1.viterbi(urec)
 
-        delta = self.tree.emit(self.x)
+        delta = self.hmmodel.emission(self)
         if self.d0 is not None:
             delta *= self.d0.m_d_delta
         if self.d1 is not None:
             delta *= self.d1.m_d_delta
 
         self.m_d_delta = np.amax(
-            self.tree.P.T * delta, axis=0
+            self.hmmodel.P.T * delta, axis=0
             )
         return delta
 
@@ -467,40 +270,66 @@ class HMNode(Node):
     """=================== SISTER DEPENDENCE STARTS HERE ==================="""
 
 
-    def calculate_sd_s_distr(self, drec=False):
+    def calculate_sd_s_distr(self, d_drec=True, n_drec=False):
         if self.mother is None and self.s_distr is None:
-            raise HMTError('Root node has no initial distribution.')
+            raise HMTError(f'Root node has no initial distribution. {self.hmmodel}, {self.id}')
+            # logging.info('Root node has no initial distribution.')
         
         if not np.isclose(np.sum(self.s_distr), 1):
             raise HMTError('S distribution probabilities do not sum to 1.')
+            # logging.info('S distribution probabilities do not sum to 1.')
+
+        if self.next is not None:
+            self.next.s_distr = self.s_distr @ self.hmmodel.life_P
+            assert self.next.s_distr.shape == (self.next.hmmodel.n_hidden, )
+            assert np.isclose(self.next.s_distr.sum(), 1)
+            if n_drec:
+                self.next.calculate_sd_s_distr(d_drec, n_drec)
+            return
 
         # Calculate children distribution
-        self.sc_distr = (self.tree.P.T @ self.s_distr).T
+        self.sc_distr = (self.hmmodel.P.T @ self.s_distr).T
 
         if not np.isclose(np.sum(self.sc_distr), 1):
             raise HMTError('S children distribution probabilities do not sum to 1.')
-
+            # logging.info('S children distribution probabilities do not sum to 1.')
+        
         # Calculate s distribution of daughter cells
         if self.d0 is not None:
             self.d0.s_distr = np.sum(self.sc_distr, axis=1)
             # Continue recursion
-            if drec:
-                self.d0.calculate_sd_s_distr(drec)
+            if d_drec:
+                self.d0.calculate_sd_s_distr(d_drec, n_drec)
         if self.d1 is not None:
             self.d1.s_distr = np.sum(self.sc_distr, axis=0)
             # Continue recursion
-            if drec:
-                self.d1.calculate_sd_s_distr(drec)   
-    
+            if d_drec:
+                self.d1.calculate_sd_s_distr(d_drec, n_drec)
 
-    def sd_upward_pass(self, urec=False):
-        if urec:
+    def sd_upward_pass(self, d_urec=True, n_urec=False):
+        if d_urec:
             # Recursion using post order tree traversal
             if self.d0 is not None:
-                self.d0.sd_upward_pass(urec)
+                self.d0.sd_upward_pass(d_urec, n_urec)
             if self.d1 is not None:
-                self.d1.sd_upward_pass(urec)
-
+                self.d1.sd_upward_pass(d_urec, n_urec)
+        if n_urec:
+            if self.next is not None:
+                self.next.sd_upward_pass(d_urec, n_urec)
+        
+        if self.next is not None:
+            if self.mother is None:
+                raise NotImplementedError("Root node with changes not implemented")
+            self.hmmodel.urec_next(self)
+            return
+            self.beta_c_u = self.hmmodel.life_P @ div0(self.next.beta, self.next.s_distr)
+            # self.beta = self.hmmodel.emission(self) * self.beta_c_u * self.s_distr
+            # self.beta /= np.sum(self.beta) # N_u^k
+            # assert self.beta.shape == (self.hmmodel.n_hidden,)
+            assert self.beta_c_u.shape == (self.hmmodel.n_hidden, )
+            # assert np.allclose(self.beta.sum(), 1), self.beta
+            return
+        
         if self.d0 is None and self.d1 is None:
             self.beta_c_u = 1
             return
@@ -508,90 +337,245 @@ class HMNode(Node):
         self.beta_c = self.sc_distr.copy()
         if self.d0 is not None:
             # Multiply columns
-            self.beta_c = (self.beta_c.T * self.tree.emit(self.d0.x)).T
+            self.beta_c = (self.beta_c.T * self.hmmodel.emission(self.d0)).T
             self.beta_c = (self.beta_c.T * self.d0.beta_c_u).T
         if self.d1 is not None:
             # Multiply rows
-            self.beta_c *= self.tree.emit(self.d1.x)
+            self.beta_c *= self.hmmodel.emission(self.d1)
             self.beta_c *= self.d1.beta_c_u
-
         N = np.sum(self.beta_c)
-        self.tree.loglikelihood += np.log(N)
+        if N == 0:
+            print(self.id)
+            if self.d0 is not None:
+                print(f"d0 emission: {self.hmmodel.emission(self.d0)}")
+            if self.d1 is not None:
+                print(f"d1 emission: {self.hmmodel.emission(self.d1)}")
+            raise HMTError("sum of beta_c is 0")
+        self.hmmodel.loglikelihood += np.log(N)
         self.beta_c = self.beta_c / N
         ## Calculate beta_{c(u), u}
-        self.beta_c_u = self.tree.P * div0(self.beta_c, self.sc_distr)
+        self.beta_c_u = self.hmmodel.P * div0(self.beta_c, self.sc_distr)
+
         # Sum over j and k
         self.beta_c_u = np.sum(self.beta_c_u, axis=(1, 2))
+        assert self.beta_c_u.shape == (self.hmmodel.n_hidden, )
 
-        if self.mother is None:
-            self.tree.loglikelihood += np.log(np.dot(
-                self.tree.emit(self.x),
+        
+        # if self.prev is not None: # (but self.next is None)
+        #     self.beta = self.hmmodel.emission(self) * self.beta_c_u * self.s_distr
+        #     self.beta /= self.beta.sum()
+        #     N = np.sum(self.beta)
+        #     self.beta /= N
+        #     self.hmmodel.loglikelihood += np.log(N)
+        #     return
+        
+        
+        if self.mother is None: # root node
+            self.hmmodel.loglikelihood += np.log(np.dot(
+                self.hmmodel.emission(self),
                 self.s_distr * self.beta_c_u
                 ))
-    
 
-    def sd_downward_pass(self, drec=False):
-        if self.d0 is None and self.d1 is None:
+
+    def sd_downward_pass(self, d_drec=True, n_drec=False):
+        """
+        Args
+        ----
+        d_drec: bool
+            Enables downward recursion for daughters (useful for debugging)
+        n_drec: bool
+            Enabels downward recursion within chain, turned on or off depending on model used
+        """
+        if self.next is not None:
+            self.hmmodel.drec_next(self)
+            if n_drec:
+                # Forward pass depends on model being used
+                self.next.sd_downward_pass(d_drec, n_drec)
+            return
+            self.xi_n = (self.hmmodel.life_P.T * div0(self.xi, self.beta_c_u)).T
+            self.xi_n *= div0(self.next.beta, self.next.s_distr)
+            # self.xi_n = np.full(
+            #     (self.hmmodel.n_hidden, self.next.hmmodel.n_hidden),
+            #     1 / (self.hmmodel.n_hidden * self.next.hmmodel.n_hidden)
+            #     )
+            assert self.xi_n.shape == (self.hmmodel.n_hidden, self.next.hmmodel.n_hidden)
+            if not np.isclose(self.xi_n.sum(), 1):
+                print(self.xi_n)
+                print(self.xi_n.sum())
+                print(self.xi_n / self.xi_n.sum())
+                print(div0(self.next.beta, self.next.s_distr))
+                raise HMTError("Smoothed probabilities do not sum to one in chain")
+            assert np.allclose(self.xi_n.sum(axis=1), self.xi)
+            # print(self.xi, self.xi_n.sum(axis=1))
+            # self.xi = self.xi_n.sum(axis=1)
+            self.next.xi = self.xi_n.sum(axis=0)
+            assert self.next.xi.shape == (self.next.hmmodel.n_hidden,)
+            assert np.isclose(self.next.xi.sum(), 1)
+            if n_drec:
+                self.next.sd_downward_pass(d_drec, n_drec)
+            
+            
+            # self.next.xi = np.full(self.next.hmmodel.n_hidden, 1 / self.next.hmmodel.n_hidden)
             return
 
-        if self.mother is None:
+        if self.d0 is None and self.d1 is None:
+            if self.mother is None:
+                # Root node with no daughters
+                self.xi = self.hmmodel.emission(self)
+                self.xi /= self.xi.sum()
+            return
+        
+        if self.mother is None and self.prev is None:
             # Root node
-            self.xi_f = div0(self.beta_c, self.sc_distr) * self.tree.P
-            self.xi_f = (self.xi_f.T * self.tree.emit(self.x)).T
+            self.xi_f = div0(self.beta_c, self.sc_distr) * self.hmmodel.P
+            self.xi_f = (self.xi_f.T *  self.hmmodel.emission(self)).T
             self.xi_f /= np.sum(self.xi_f)
             
             # Sum over i and j
             self.xi = np.sum(self.xi_f, axis=(1, 2))
         else:
-            self.xi_f = (self.tree.P.T * div0(self.xi, self.beta_c_u)).T
+            self.xi_f = (self.hmmodel.P.T * div0(self.xi, self.beta_c_u)).T
             self.xi_f *= div0(self.beta_c, self.sc_distr)
-
         # Quick check to see probabilities are the same
         # print(np.allclose(self.xi - np.sum(self.xi_f, axis=(1, 2))))
         self.xi_c = np.sum(self.xi_f, axis=0)
 
         # if self.id == 1:
-        #     print(self.tree.emit(self.x))
+        #     print( self.hmmodel.emission(self.x, self.c))
         
         if not np.isclose(np.sum(self.xi), 1):
-            print(self.id, np.sum(self.xi))
+            print(self.beta_c)
+            print(self.id, self.xi, np.sum(self.xi))
             raise HMTError("Smoothed probabilities do not sum to 1")
+            # logging.info("Smoothed probabilities do not sum to 1")
 
         if not np.isclose(np.sum(self.xi_c), 1):
             print(self.id, np.sum(self.xi_c))
             raise HMTError("Smoothed children probabilities do not sum to 1")
+            # logging.info("Smoothed children probabilities do not sum to 1")
         
         ## Calculate xi values of daughter cells and continue recursion
         if self.d0 is not None:
             # Sum over k
             self.d0.xi = np.sum(self.xi_c, axis=1)
-            if drec:
-                self.d0.sd_downward_pass(drec)
+            assert self.d0.xi.shape == (self.d0.hmmodel.n_hidden,), f"{self.hmmodel.n_hidden, self.d0.hmmodel.n_hidden}"
+            if d_drec:
+                self.d0.sd_downward_pass(d_drec, n_drec)
         if self.d1 is not None:
             # Sum over j
             self.d1.xi = np.sum(self.xi_c, axis=0)
-            if drec:
-                self.d1.sd_downward_pass(drec)
+            assert self.d1.xi.shape == (self.d1.hmmodel.n_hidden,), f"{self.hmmodel.n_hidden, self.d1.hmmodel.n_hidden}"
+            if d_drec:
+                self.d1.sd_downward_pass(d_drec, n_drec)
     
 
-    def sd_extract_ml_s(self, drec=False):
+    def sd_extract_ml_s(self, d_drec=True, n_drec=False):
+        if self.next is not None:
+            self.hmmodel.extract_next_ml_s(self)
+            if n_drec:
+                self.next.sd_extract_ml_s(d_drec, n_drec)
+            return
+        
+        if self.mother is None and self.prev is None:
+            self.ml_s = np.argmax(self.xi)
+        
         if self.d0 is None and self.d1 is None:
             return
-
-        if self.mother is None:
-            self.ml_s = np.argmax(self.xi)
 
         ml_sc = np.unravel_index(np.argmax(self.xi_f[self.ml_s]), self.xi_c.shape)
 
         if self.d0 is not None:
             self.d0.ml_s = ml_sc[0]
             # Continue recursion
-            if drec:
-                self.d0.sd_extract_ml_s(drec)
+            if d_drec:
+                self.d0.sd_extract_ml_s(d_drec, n_drec)
         if self.d1 is not None:
             self.d1.ml_s = ml_sc[1]
             # Continue recursion
-            if drec:
+            if d_drec:
+                self.d1.sd_extract_ml_s(d_drec, n_drec)
+
+
+    def sd_viterbi(self, d_urec=True):
+        if self.next is not None:
+            return
+        if d_urec:
+            # Recursion using post order tree traversal
+            if self.d0 is not None:
+                # print(self.id, "Left")
+                self.d0.sd_viterbi(d_urec)
+            if self.d1 is not None:
+                # print(self.id, "Right")
+                self.d1.sd_viterbi(d_urec)
+
+        # print(f"   **   {self.id}   **")
+        self.delta = self.hmmodel.emission(self)
+        
+        if self.d0 is None and self.d1 is None:
+            return
+        
+        # Store the hidden states of the daughters that are 
+        # optimal for each possible hidden state
+
+        # _delta is the part we maximise in the viterbi algorithm
+        _delta = self.hmmodel.P
+        if self.d0 is not None: # Multiply j component by daughter 0 delta
+            _delta = np.transpose(_delta, axes=(0, 2, 1)) * self.d0.delta
+            _delta = np.transpose(_delta, axes=(0, 2, 1))
+        else: # Marginalise over j component
+            _delta = _delta.sum(axis=1)
+
+        if self.d1 is not None: # Multiply k component by daughter 1 delta
+            _delta *= self.d1.delta
+        else: # Marginalise over k component
+            _delta = _delta.sum(axis=2)
+        
+        # print(f"{_delta.shape = }")
+        # print(f"{self.delta.shape = }")
+        # End up with either rxrxr tensor (2 daughters) or rxr matrix (1 daughter)
+
+        # For each state i in the current node we find the daughter states that 
+        # would maximise the probability of the tree from here
+        self.optimal_daughter_states = np.array([
+            np.unravel_index(_delta[i].argmax(), _delta[i].shape) for i in range(self.hmmodel.n_hidden)
+            ])
+        # print(f"{self.optimal_daughter_states.shape = }")
+        # print(f"{self.optimal_daughter_states[0].shape = }")
+        max_delta = np.zeros(self.hmmodel.n_hidden)
+        for i in range(self.hmmodel.n_hidden):
+            if self.d0 is not None and self.d1 is not None:
+                opt_d0_state, opt_d1_state = self.optimal_daughter_states[i][0], self.optimal_daughter_states[i][0]
+                max_delta[i] = _delta[i, opt_d0_state, opt_d1_state]
+                continue
+            if self.d0 is not None:
+                max_delta[i] = _delta[i, self.optimal_daughter_states[i][0]]
+            else:
+                max_delta[i] = _delta[i, self.optimal_daughter_states[i][1]]
+
+        max_delta = np.array(max_delta)
+        # print(f"{max_delta.shape = }")
+
+        self.delta *= max_delta
+#       /\
+#       |
+#      \/
+    def sd_viterbi_extract_ml_s(self, drec=False):
+        """
+        Extracts hidden state of daughter nodes (and current node if self is the root)
+        based on Viterbi algorithm
+        """
+        if self.mother is None: # Root node
+            self.ml_s = np.argmax(np.multiply(self.delta, self.s_distr))
+        if self.d0 is None and self.d1 is None: # Leaves
+            return
+
+        if self.d0 is not None:
+            self.d0.ml_s = self.optimal_daughter_states[self.ml_s][0]
+            if drec: # Continue recursion
+                self.d0.sd_extract_ml_s(drec)
+        if self.d1 is not None:
+            self.d1.ml_s = self.optimal_daughter_states[self.ml_s][1]
+            if drec: # Continue recursion
                 self.d1.sd_extract_ml_s(drec)
 
 
@@ -616,11 +600,13 @@ class HMNode(Node):
         if measure == "true_s":
             if self.s is None:
                 raise HMTError("True hidden states must be known, try measure='ml_s'.")
+                # logging.info("True hidden states must be known, try measure='ml_s'.")
             s_list.append((self.s, self.d0.s, self.d1.s))
             
         if measure == "ml_s":
             if self.ml_s is None:
                 raise HMTError("Find ML hidden states first.")
+                # logging.info("Find ML hidden states first.")
             
             s_list.append((self.ml_s, self.d0.ml_s, self.d1.ml_s))
 
@@ -637,46 +623,653 @@ class HMNode(Node):
             self.d1.xi_null_sum(total)
     
 
-    def sample(self, N, p):
+    def sample(self, N, p, has_death=False, truncated=False):
+        """
+        Args
+        ---
+        truncated: used for debugging   
+        """
         if N == 1:
-            self.tree.leaves.append(self)
-            return
+            self.hmmodel.leaves.append(self)
+            return 0
+
         # Randomly choose p daughter
         q0 = np.random.choice((0, 0.5, 1), p=(p/2, 1 - p, p/2))
         N0 = normal_round(q0 * (N - 1))
         N1 = N - 1 - N0
         
-        if self.tree.sister_dep:
-            c_distr = self.tree.P[self.s]
+        if self.hmmodel.sister_dep:
+            c_distr = self.hmmodel.P[self.s]
             s0, s1  = np.unravel_index(
-                np.random.choice(np.arange(self.tree.n_hidden ** 2), 1, p=c_distr.flatten())[0],
+                np.random.choice(np.arange(self.hmmodel.n_hidden ** 2), 1, p=c_distr.flatten())[0],
                 c_distr.shape
                 )
         else:
-            curr_distr = self.tree.P[self.s]
-            s0, s1 = np.random.choice(np.arange(self.tree.n_hidden), 2, p=curr_distr, replace=True)
-
+            curr_distr = self.hmmodel.P[self.s]
+            s0, s1 = np.random.choice(np.arange(self.hmmodel.n_hidden), 2, p=curr_distr, replace=True)
+        remaining_0, remaining_1 = 0, 0
         if N0 != 0:
-            x0 = np.squeeze(np.random.multivariate_normal(self.tree.mus[s0], self.tree.sigmas[s0], 1))
-            if self.tree.n_obs == 1:
+            if has_death:
+                death_0, x0 = self.hmmodel.emission_distr.sample(s0) # Assumes death distribution has 2 outputs
+            elif truncated:
+                trunc_ind = np.random.choice(np.arange(self.hmmodel.n_obs))
+                t = np.random.normal(self.hmmodel.emission_distr.mus[s0])
+            else:
+                x0 = self.hmmodel.emission_distr.sample(s0)
+            if self.hmmodel.n_obs == 1:
                 x0 = float(x0)
-            d0 = HMNode(self.id * 2, observed=x0, tree=self.tree, s=s0)
+            if isinstance(self.id, str):
+                tree, m_id = self.id.split('-')
+                cell_id = '-'.join((tree, str(int(m_id) * 2)))
+            else:
+                cell_id = self.id * 2
+            d0 = HMNode(cell_id, observed=x0, hmmodel=self.hmmodel, s=s0)
             d0.mother = self
             d0._path = self._path + '0'
             self.d0 = d0
-            self.d0.sample(N0, p)
+            if has_death:
+                self.d0.d = death_0
+                if death_0:
+                    self.hmmodel.leaves.append(self.d0)
+                    remaining_0 += N0 - 1
+                else:
+                    remaining_0 += self.d0.sample(N0, p, has_death=has_death)
+            else:
+                remaining_0 += self.d0.sample(N0, p, has_death=has_death) 
         if N1 != 0:
-            x1 = np.squeeze(np.random.multivariate_normal(self.tree.mus[s1], self.tree.sigmas[s1], 1))
-            if self.tree.n_obs == 1:
+            if has_death:
+                death_1, x1 = self.hmmodel.emission_distr.sample(s1)
+            else:
+                x1 = self.hmmodel.emission_distr.sample(s1)
+            if self.hmmodel.n_obs == 1:
                 x1 = float(x1)
-            d1 = HMNode(self.id * 2 + 1, observed=x1, tree=self.tree, s=s1)
+            if isinstance(self.id, str):
+                tree, m_id = self.id.split('-')
+                cell_id = '-'.join((tree, str(int(m_id) * 2 + 1)))
+            else:
+                cell_id = self.id * 2 + 1
+            d1 = HMNode(cell_id, observed=x1, hmmodel=self.hmmodel, s=s1)
             d1.mother = self
             d1._path = self._path + '1'
             self.d1 = d1
-            self.d1.sample(N1, p)
+            if has_death:
+                self.d1.d = death_1
+                if death_1:
+                    self.hmmodel.leaves.append(self.d1)
+                    remaining_1 += N1 - 1
+                else:
+                    remaining_1 += self.d1.sample(N1, p, has_death=has_death)
+            else:
+                remaining_1 += self.d1.sample(N1, p, has_death=has_death)
+        return remaining_0 + remaining_1 # Return number of remaining cells to sample
+    
+
+    def from_numpy(self, X, has_true_s=False, obs_func=None):
+        daughter_inds = np.where((X[:, 1] == self.id) & (X[:, 0] != self.id))[0]
+
+        # If no daughters
+        if not len(daughter_inds):
+            return
+        
+        ## Add d0
+        d0_data = X[daughter_inds[0]]
+        obs = d0_data[2 : 2 + self.hmmodel.n_obs].astype(float)
+        if obs_func is not None:
+            obs = obs_func(obs)
+
+        # Initialise d0 node
+        d0 = HMNode(
+            node_id=d0_data[0],
+            observed=obs,
+            hmmodel=self.hmmodel,
+            s=d0_data[-1] if has_true_s else None
+        )
+        # Connect to mother node (i.e. current node = self)
+        self.add_daughter(d0)
+        
+        # Add d0's daughters
+        self.d0.from_numpy(X=X, has_true_s=has_true_s, obs_func=obs_func)
+
+        # If only one daughter
+        if len(daughter_inds) == 1:
+            return
+        
+        ## Else add d1
+        d1_data = X[daughter_inds[1]]
+        
+        obs = d1_data[2 : 2 + self.hmmodel.n_obs].astype(float)
+        if obs_func is not None:
+            obs = obs_func(obs)
+
+        # Initialise d1 node
+        d1 = HMNode(
+            node_id=d1_data[0],
+            observed=obs,
+            hmmodel=self.hmmodel,
+            s=d1_data[-1] if has_true_s else None
+        )
+        # Connect to mother node (i.e. current node = self)
+        self.add_daughter(d1)
+        
+        # Add d1's daughters
+        self.d1.from_numpy(X=X, has_true_s=has_true_s, obs_func=obs_func)
+    
+    def split(self, start_time, change_time):
+        """
+        NOTE assumes data is lognormally distributed
+        """
+        # print("Splitting")
+        assert self.hmmodel.next_env is not None
+        x = np.where(np.isnan(self.x), self.c, self.x) if self.c is not None else self.x
+        cumsum = np.cumsum(np.exp(x))
+        phase_ind = np.where(start_time + cumsum > change_time)[0][0]
+        next_time = start_time + cumsum[phase_ind] - change_time
+        prev_time = change_time - start_time - cumsum[phase_ind - 1] if phase_ind else change_time - start_time
+        next_time, prev_time = np.log(next_time), np.log(prev_time)
+        # print(start_time + cumsum, change_time)
+        # print(np.exp(prev_time))
+        # print(next_time)
+        next_x, next_c = self.x.copy(), self.c.copy()
+        next_x[:phase_ind], next_c[:phase_ind] = np.nan, np.nan
+        next_x[phase_ind] = next_time
+        next_t = np.full_like(self.x, np.nan)
+        next_t[phase_ind] = prev_time
+        self.x[phase_ind:], self.c[phase_ind:] = np.nan, np.nan
+        self.c[phase_ind] = prev_time
+
+        # print(np.exp(self.x), np.exp(next_x))
+        # print(np.exp(self.c), np.exp(next_t), np.exp(next_c))
+        next_node = HMNode(
+            node_id=self.id,
+            observed=next_x,
+            hmmodel=self.hmmodel.next_env,
+            c=next_c,
+            t=next_t,
+            d=self.d,
+            hidden_state=self.s   
+        )
+        self.d = 0 if self.d is not None and self.d else self.d
+        self.next, next_node.prev = next_node, self
+        self.hmmodel.trans_leaves.append(self)
+        self.hmmodel.leaves.append(self)
+        self.hmmodel.next_env.roots.append(next_node)
+        self.hmmodel.next_env.trans_roots.append(next_node)
+        
+    @staticmethod
+    def from_pandas_row(
+        row,
+        obs_cols,
+        hmmodel,
+        obs_func=None
+        ):
+        obs = row[obs_cols].astype(float).to_numpy()
+        if obs_func is not None:
+            obs = obs_func(obs)
+        if "C" in row.index:
+            c = np.full_like(obs, np.nan, dtype=float)
+            censoring_inds = row["C"]
+            if isinstance(censoring_inds, str):
+                censoring_inds = eval(censoring_inds)
+            if censoring_inds:
+                censoring_inds = np.asarray(censoring_inds) - 1
+                c[censoring_inds] = obs[censoring_inds]
+                obs[censoring_inds] = np.nan
+        else:
+            c = None
+        return HMNode(
+            node_id=row['Cell ID'],
+            observed=obs,
+            c=c,
+            d=row["D"] if "D" in row.index else None,
+            hmmodel=hmmodel,
+            hidden_state=row["hidden_state"] if "hidden_state" in row.index else None
+        )
+
+    def from_pandas(
+            self,
+            df,
+            obs_cols,
+            obs_func=None,
+            curr_time=0,
+            change_time=None
+            ):
+        daughter_inds = df.index[df['Mother ID'] == self.id].tolist()
+        # If no daughters
+        for i, daughter_ind in enumerate(daughter_inds):
+            if i == 2:
+                # warnings.warn("Currently only 2 daughters can be read, discarding third")
+                break # currently we only allow two daughters to be read
+            ## Add daughter
+            d = HMNode.from_pandas_row(
+                row=df.loc[daughter_ind],
+                obs_cols=obs_cols,
+                hmmodel=self.hmmodel,
+                obs_func=obs_func
+            )
+            self.add_daughter(d)
+            next_time = curr_time + np.sum(np.where(~np.isnan(d.x), np.exp(d.x), 0))
+            next_time += np.sum(np.where(~np.isnan(d.c), np.exp(d.c), 0))
+            if (
+                change_time is not None and
+                curr_time < change_time and
+                next_time > change_time
+                ):
+                # print(d.id, round(curr_time), change_time, round(next_time))
+                d.split(start_time=curr_time, change_time=change_time)
+                d = d.next
+            d.from_pandas(
+                df=df, obs_cols=obs_cols, curr_time=next_time, change_time=change_time, obs_func=obs_func
+                )
+            
 
 
-class HMTree(Tree, HMModel):
+class HMModel:
+    """
+    Base class for parameter methods for hidden Markov trees. Used to implement
+    basic checks when setting parameters
+    
+    Methods
+    -------
+    init_params()
+        Initialises parameters
+    check_params()
+        Checks parameters and raises exceptions if there are problems with any
+    set_params()
+        Sets parameters specified in arguments
+    get_params()
+        Returns dictionary with current parameters
+    clear_params()
+        Sets all parameters to None
+    """
+    def __init__(
+            self,
+            n_hidden,
+            n_obs,
+            sister_dep=True,
+            daughter_order=False,
+            has_null=False,
+            emission_distr="MVN",
+            **emission_kwargs
+            ):
+        # Model parameters
+        self._n_hidden = n_hidden
+        self._n_obs = n_obs
+        # print(self._n_hidden, self._n_obs)
+        self.sister_dep = sister_dep
+        self.daughter_order = daughter_order
+        self.has_null = has_null
+
+        # Likelihood of the tree / forest to test for convergence
+        self.loglikelihood = 0 
+
+        # Model parameters
+        self.init_s_distr = None
+        self.P = None
+        self.set_emissions(emission_distr, **emission_kwargs)
+
+        super().__init__() 
+        # This initialises Tree / Forest class when HMTree / HMForest __init__() is called
+        # or initialises a python Object class when HMModel.__init__() is directly called
+    
+    @property
+    def n_hidden(self):
+        return self._n_hidden
+    
+    @n_hidden.setter
+    def n_hidden(self, value):
+        if not isinstance(value, int):
+            raise HMTError("Number of hidden states must be an integer.")
+        if value < 1:
+            raise HMTError("Number of hidden states must be greater than 0.")
+        # print(f"Setting n_hidden to {value}")
+        self._n_hidden = value
+        self.emission_distr.n_hidden = value
+        self.clear_params()
+    
+
+    @property
+    def n_obs(self):
+        return self._n_obs
+    
+    @n_obs.setter
+    def n_obs(self, value):
+        if not isinstance(value, int):
+            raise HMTError("Number of observations must be an integer.")
+        if value < 1:
+            raise HMTError("Number of observations must be greater than 0.")
+        # print(f"Setting n_obs to {value}")
+        self._n_obs = value
+        self.emission_distr.n_obs = value
+        self.clear_params()
+
+
+    def init_params(self, init_method='kmeans'):
+        if self.init_s_distr is None and not (hasattr(self, "prev_env") and self.prev_env is not None):
+            # Randomly initialise initial distribution
+            self.init_s_distr = np.random.uniform(0, 1, self.n_hidden)
+            # Normalise
+            self.init_s_distr /= np.sum(self.init_s_distr)
+
+
+        if self.P is None:
+            # Randomly initialise transistion matrix
+            if self.sister_dep:
+                self.P = np.random.uniform(0, 1, (self.n_hidden, self.n_hidden, self.n_hidden))
+                # Normalise for each value of i
+                self.P = (self.P.T / np.sum(self.P, axis=(1, 2))).T
+                # self.P = np.full((self.n_hidden, self.n_hidden, self.n_hidden), 1 / self.n_hidden ** 2)
+                if not self.daughter_order:
+                    self.P = (self.P + np.transpose(self.P, axes=(0, 2, 1))) / 2
+            else:
+                self.P = np.random.uniform(0, 1, (self.n_hidden, self.n_hidden))
+                # Normalise for each value of i
+                self.P = (self.P.T / np.sum(self.P, axis=1)).T
+        
+        if self.emission_distr is None:
+            raise HMTError("Cannot initialise parameters when emission distribution is None")
+        self.emission_distr.init_params(init_method=init_method)
+
+
+    def check_params(self):
+        if self.init_s_distr is not None:
+            if self.init_s_distr.shape[0] != self.n_hidden:
+                raise HMTError("Initial distribution must be defined for all s values")
+            if not np.isclose(sum(self.init_s_distr), 1):
+                raise HMTError('init_s_distr must be a probability distribution.')
+
+        if self.P is not None:
+            if self.P.shape[0] != self.n_hidden:
+                raise HMTError('P must be rxr or rxrxr where r is the number of hidden states.')
+            if self.P.ndim == 2:
+                if not np.allclose(self.P.sum(axis=1), 1):
+                    raise HMTError('Rows of P must sum to 1.')
+                if self.P.shape[0] != self.P.shape[1]:
+                    raise HMTError('P must be a square matrix.')
+                if self.P.shape[0] != self.init_s_distr.shape[0]:
+                    raise HMTError('P must have the number of columns as init_s_distr.')
+            if self.P.ndim == 3:
+                # Sister dependence
+                if self.P.shape[0] != self.P.shape[1] or self.P.shape[0] != self.P.shape[2]:
+                    raise HMTError('P must be a cube.')
+                if not np.allclose(self.P.sum(axis=(1, 2)), 1):
+                    raise HMTError('Matrices in of P must sum to 1.')  
+        
+        self.emission_distr.check_params()
+
+
+    def set_params(self, init_s_distr=None, P=None, sister_dep=None, daughter_order=None, check_params=True, **emission_params):
+        if sister_dep is not None:
+            self.sister_dep = sister_dep
+        
+        if sister_dep is not None:
+            self.daughter_order = daughter_order
+
+        if init_s_distr is not None:
+            self.init_s_distr = init_s_distr.copy()
+
+        if P is not None:
+            self.P = P.copy()
+        
+        self.emission_distr.set_params(**emission_params, check_params=check_params)
+        
+        if check_params:
+            self.check_params()
+
+
+    def set_emissions(self, emission_distr="MVN", **emission_kwargs):
+        if isinstance(emission_distr, str):
+            if emission_distr == "MVN":
+                self.emission_distr = emissions.MVN(self.n_hidden, self.n_obs, hmmodel=self, **emission_kwargs)
+            elif emission_distr == "Gamma":
+                self.emission_distr = emissions.MVGamma(self.n_hidden, self.n_obs, hmmodel=self, **emission_kwargs)
+            else:
+                raise NotImplementedError("Only MVN and Gamma distributions are implemented by default")
+        else:
+            self.emission_distr = emission_distr
+            emission_distr.hmmodel = self
+            if emission_kwargs:
+                self.emission_distr.set_params(**emission_kwargs)
+        if self.emission_distr.type != "ML":
+            raise HMTError("For maximum likelihood (ML) model, emission distribution must also be ML")
+    
+    def emission(self, node):
+        return self.emission_distr.emission(node)
+
+    def get_params(self):
+        return {
+            'init_s_distr': self.init_s_distr,
+            'P': self.P,
+            'sister_dep': self.sister_dep,
+            'daughter_order': self.daughter_order,
+            **self.emission_distr.get_params()
+        }
+
+    def clean(self):
+        pass
+
+    def clear_params(self):
+        self.init_s_distr = None
+        self.P = None
+        self.emission_distr.clear_params()
+        self.clean()
+    
+
+    def number_of_params(self):
+        # pi
+        n_params = self.n_hidden - 1
+
+        # P
+        if self.daughter_order:
+            n_params += self.n_hidden ** 3 - self.n_hidden
+        else:
+            n_params += self.n_hidden ** 2 * (self.n_hidden + 1) // 2 - self.n_hidden
+        
+        # Emission parameters
+        n_params += self.emission_distr.number_of_params()
+        return n_params        
+    
+
+    def permute(self, perm):
+        """
+        Takes permutation of *true* hidden states and uses the inverse of that
+        to permute the predicted states and parameters
+        """
+        # best_acc, perm = self.best_permutation()
+        # if perm is None:
+        #     return best_acc
+        # perm = list(perm)
+
+        # Permute ml_s
+        self.permute_ml_s(perm)
+        self.init_s_distr = self.init_s_distr[perm, ...]
+
+        # Permute P (permute in all dimensions in order)
+        self.P = self.P[perm, ...][:, perm, ...]
+        if self.P.ndim == 3:
+            self.P = self.P[:, :, perm]
+
+        # Permute emission parameters=
+        self.emission_distr.permute(perm)
+        # return best_acc
+    
+
+    def permute_ml_s(self, perm):
+        self.apply(lambda ml_s: perm[ml_s], 'ml_s')
+    
+
+    def best_permutation(self):
+        best_acc = self.acc()
+        for perm in permutations(range(self.n_hidden)):
+            self.permute_ml_s(perm)
+            acc = self.acc()
+            if acc > best_acc:
+                best_acc = acc
+                best_perm = perm
+
+
+    def update_init_s_distr(self):
+        pass # Different for tree / forest
+
+
+    def mother_xi_sum(self):
+        pass # Different for tree / forest
+
+
+    def update_P(self):        
+        if self.P.ndim == 2:
+            m_d_xi_sum = self.sum('m_d_xi')
+            mother_xi_sum = self.mother_xi_sum()
+            self.P = (m_d_xi_sum.T / mother_xi_sum).T
+            if not np.allclose(np.sum(self.P, axis=1), 1):
+                print(np.sum(self.P, axis=1))
+                raise HMTError("Updating P matrix has gone wrong.")
+            return
+        
+        # self.P.ndim == 3
+        xi_f_sum = self.sum('xi_f')
+        if not self.daughter_order:
+            # Enforce symmetry
+            xi_f_sum = (xi_f_sum + np.transpose(xi_f_sum, axes=(0, 2, 1))) / 2
+            if not np.allclose(xi_f_sum, np.transpose(xi_f_sum, axes=(0, 2, 1))):
+                raise HMTError("P not symmetric in update step")
+        # Normalise
+        self.P = (xi_f_sum.T / (self.sum('xi') - self.leaf_sum('xi'))).T
+        # if self.it % 10 == 0:
+        #     print((f"{self.sum('xi') = }"))
+        #     print((f"{self.leaf_sum('xi') = }"))
+
+        # Ensure P sums to 1
+        if not np.allclose(np.sum(self.P, axis=(1, 2)), 1):
+            print(f"Iteration {self.it}")
+            print(np.sum(self.P, axis=(1, 2)))
+            print((f"{self.sum('xi') = }"))
+            print((f"{self.leaf_sum('xi') = }"))
+            print(self.P)
+            raise HMTError("Updating P matrix has gone wrong.")
+    
+
+    def Mstep(self):
+        # Update root nodes hidden state distribution
+        self.update_init_s_distr()
+        if not np.isclose(np.sum(self.init_s_distr), 1):
+            raise HMTError("Updating initial distribution has gone wrong.")
+
+        # Update P
+        self.update_P()
+        
+        # Update emission distribution parameters
+        self.emission_distr.update_params(self)
+    
+
+    def find_missing_pattern(self):
+        if self.find_null():
+            self.has_null = True
+            if self.has_death():
+                self.death_missing_pattern()
+            else:
+                self.emission_distr.missing_pattern = {idxs: defaultdict() for idxs in self.null_indices()}
+
+    def death_missing_pattern(self):
+        for death_ind, distr in enumerate(self.emission_distr.distrs):
+            if death_ind == 0:
+                distr.missing_pattern = {idxs: defaultdict() for idxs in self.null_indices()}
+                continue
+            # Just search leaf nodes
+            death_nodes = [node for node in self.leaves if node.d == death_ind]
+            null_idxs = {
+                tuple(
+                    np.argwhere(np.isnan(node.x[:death_ind])).flatten()
+                    ) for node in death_nodes if np.isnan(node.x[:death_ind]).any()
+                }
+            distr.missing_pattern = {idxs: defaultdict() for idxs in null_idxs}
+
+    def train(self, n_starts=1, tol=1e-6, maxits=200, store_log_lks=False, permute=False, overwrite_params=False,
+              store_params=None):
+
+        if not overwrite_params:
+            # NOTE ensure only the parameters you want are stored in the model - all others should be None
+            start_params = self.get_params() 
+
+        self.find_missing_pattern()
+
+        best_loglk = -np.inf
+
+        for _ in range(n_starts):
+            self.it = 0
+            self.clear_params()
+            if not overwrite_params:
+                self.set_params(**start_params)
+            self.init_params()
+            
+            if store_params is not None:
+                if isinstance(store_params, str):
+                    stored_params = [self.get_params()[store_params]]
+                elif isinstance(store_params, list):
+                    stored_params = {key: [self.get_params()[key]] for key in store_params}
+
+            curr_log_lk = self.Estep()
+            self.Mstep()
+
+            if store_params is not None:
+                curr_params = self.get_params()
+                if isinstance(store_params, str):
+                    stored_params.append(curr_params[store_params])
+                elif isinstance(store_params, list):
+                    for key in store_params:
+                        stored_params[key].append(curr_params[key])
+            
+            if store_log_lks:
+                log_lks = np.zeros(maxits)
+                log_lks[0] = curr_log_lk
+
+
+            for self.it in range(1, maxits):
+                prev_log_lk = curr_log_lk
+                curr_log_lk = self.Estep()
+                self.Mstep()
+                if store_params is not None:
+                    curr_params = self.get_params()
+                    if isinstance(store_params, str):
+                        stored_params.append(curr_params[store_params])
+                    elif isinstance(store_params, list):
+                        for key in store_params:
+                            stored_params[key].append(curr_params[key])
+                if store_log_lks:
+                    log_lks[self.it] = curr_log_lk
+                if abs((prev_log_lk - curr_log_lk) / prev_log_lk) < tol:
+                    break
+            
+            if curr_log_lk > best_loglk:
+                best_loglk = curr_log_lk
+                best_params = self.get_params()
+                best_it = self.it # Used to ensure best run actually converged
+                if store_log_lks:
+                    best_loglks = log_lks[:self.it]
+                if store_params is not None:
+                    best_stored_params = stored_params
+        
+        if best_it == maxits - 1:
+            warnings.warn("Loglikelihood did not converge, try changing the tol and maxits arguments")
+        
+        self.set_params(**best_params)
+
+        if permute:
+            self.permute()
+
+        if store_params is not None and store_log_lks:
+            return best_it, best_loglks, best_stored_params
+        if store_log_lks:
+            return best_it, best_loglks
+        if store_params is not None:
+            return best_it, best_stored_params
+        return best_it
+    
+    def has_death(self):
+        death_inds = np.unique([leaf.d for leaf in self.leaves])
+        return len(death_inds) > 1
+
+
+class HMTree(HMModel, Tree):
     """
     A structure to encapsulate a hidden Markov tree. The structure of the
     tree itself, and attributes of individual nodes are stored in self.root 
@@ -694,51 +1287,16 @@ class HMTree(Tree, HMModel):
         Transition matrix for the hidden states defined by
         P[i, j] = P(S_u = j | S_m = i)
         where m is the mother node of node u
-        or 
+                    or 
         P[i, j, k] = P(S_d0 = j, S_d1 = k | S_m = i)
         if sister_dep == True
-    emit: np.ndarray
-        Emission matrix, x and s and returns P(X = x | S = s)
     loglikelihood: float
         Loglikelihood of the optimal tree.
     optimal_tree_prob: float
         The probability of the hidden state tree given the observed data
     """
-    def __init__(self, n_hidden, n_obs, sister_dep=True, daughter_order=False, root=None):
-        super().__init__(root)
-        self.n_hidden = n_hidden
-        self.n_obs = n_obs
-        self.sister_dep = sister_dep
-        self.daughter_order = daughter_order
-
-        self.time = np.zeros(10)
-
-        self.loglikelihood = None
-        self.optimal_tree_prob = None
-        
-        self.init_s_distr = None
-        self.P = None
-        self.emit_mat = None
-        self.mus = None
-
-        self.sigmas = None
-        self.sigmainv = None
-        self.detsigma = None
-
-        # Variational Bayesian parameters
-        self.prior_init_s_weights = None
-        self.prior_P_weights = None
-        self.prior_mis = None
-        self.prior_betas = None
-        self.prior_sigma_dof = None
-        self.prior_sigma_Winv = None
-
-        self.init_s_weights = None
-        self.P_weights = None
-        self.mis = None
-        self.betas = None
-        self.sigma_dof = None
-        self.sigma_W = None
+    def __init__(self, *hmm_args, **hmm_kwargs):
+        super().__init__(*hmm_args, **hmm_kwargs)
 
 
     def __repr__(self):
@@ -748,71 +1306,9 @@ class HMTree(Tree, HMModel):
     def __str__(self):
         if self.root is not None:
             self.root.printTree()
-            return('')
-        return("HMTree()")
-
-
-    def emit(self, x):
-        """
-        Returns the vector of emmission probabilities s.t.
-        emit(x)[i] = P( X = x | S = i )
-        If null values are encountered then probability is marginalised over all
-        non-null entries of x.
-        """
-        if self.emit_mat is not None:
-            return self.emit_mat[:, x]
-        if not np.isnan(x).any():
-            return mvn_pdf(x, self.mus, self.sigmainv, self.detsigma, self.n_obs)
-        if np.isnan(x).all():
-            raise HMTError("Cannot calculate probability of null vector")
-
-        # If only a subset of x is null then we marginalise the probability
-        non_null_indices = (~np.isnan(x)).nonzero()[0]
-        # print(non_null_indices)
-        marg_x = x[non_null_indices]
-        marg_mus = self.mus[:, non_null_indices]
-        # print(self.sigmas.shape)
-        marg_sigmas = self.sigmas[:, non_null_indices][:, :, non_null_indices]
-        try:
-            marg_sigmainv = np.linalg.inv(marg_sigmas)
-        except:
-            raise HMTError("x contains null values and marginalised sigma matrix is singular.")
-        marg_detsigma = np.linalg.det(marg_sigmas)
-        return mvn_pdf(marg_x, marg_mus, marg_sigmainv, marg_detsigma, non_null_indices.shape[0])
-
-
-    def viterbi(self):
-        for leaf in self.leaves:
-            leaf.viterbi(urec=True)
-        self.optimal_tree_prob = max(self.init_s_distr * self.root.delta)
-
-
-    def s_distr(self):
-        # Initialise root values S distribution
-        self.root.s_distr = 1.0 * self.init_s_distr
-        # Recursively calculate S distributions
-        if self.sister_dep:
-            self.root.calculate_sd_s_distr(drec=True)
-        else:
-            self.root.calculate_s_distr(drec=True)        
-
-
-    def upward_pass(self):
-        # Reset loglikelihood
-        self.loglikelihood = 0
-        if self.sister_dep:
-            self.root.sd_upward_pass(urec=True)
-        else:            
-            self.root.upward_pass(urec=True)
-        return self.loglikelihood
+            return ''
+        return "HMTree()"
     
-
-    def downward_pass(self):
-        if self.sister_dep:
-            self.root.sd_downward_pass(drec=True)
-        else:
-            self.root.downward_pass(drec=True)
-
 
     def Estep(self):
         # Handle Errors
@@ -820,264 +1316,170 @@ class HMTree(Tree, HMModel):
             raise HMTError('Tree has no initial S distribution.')
         if self.P is None:
             raise HMTError('Tree has no transition matrix P.')
-        if self.emit is None:
+        if self.emission_distr is None:
             raise HMTError('Tree has no emission distribution.')
-
-        # Caluculate the hidden state distribution for each node
-        start = default_timer()
-        self.s_distr()
-        stop = default_timer()
-        self.time[0] += stop - start
         
-        # Perform the upward and downward passes to calculate smoothed probabilities
-        start = default_timer()
-        log_lk = self.upward_pass()
-        stop = default_timer()
-        self.time[1] += stop - start
-
-        start = default_timer()
-        self.downward_pass()
-        stop = default_timer()
-        self.time[2] += stop - start
-        return log_lk
-
-
-    def Mstep(self):
-        ## Update initial S distribution
-        self.init_s_distr = self.root.xi.copy()
-        if not np.isclose(np.sum(self.init_s_distr), 1):
-            raise HMTError("Updating initial distribution has gone wrong.")
-
-        xi_sum = self.sum('xi')
-        leaf_sum = np.sum([l.xi for l in self.leaves], axis=0)
-
-        ## Update P
-        if self.P.ndim == 2:
-            m_d_xi_sum = self.sum('m_d_xi')
-            mother_xi_sum = self.root.mother_xi_sum()
-            self.P = (m_d_xi_sum.T / mother_xi_sum).T
-            if not np.allclose(np.sum(self.P, axis=1), 1):
-                print(np.sum(self.P, axis=1))
-                raise HMTError("Updating P matrix has gone wrong.")
-        if self.P.ndim == 3:
-            xi_f_sum = self.sum('xi_f')
-            if self.daughter_order:
-                self.P = (xi_f_sum.T / (xi_sum - leaf_sum)).T
-            else:
-                xi_f_sum = (xi_f_sum + np.transpose(xi_f_sum, axes=(0, 2, 1))) / 2
-                self.P = (xi_f_sum.T / (xi_sum - leaf_sum)).T
-                if not np.allclose(self.P, np.transpose(self.P, axes=(0, 2, 1))):
-                    raise HMTError("P not symmetric in update step")
-            
-            # Ensure P sums to 1
-            if not np.allclose(np.sum(self.P, axis=(1, 2)), 1):
-                print(f"Iteration {self.it}")
-                print(np.sum(self.P, axis=(1, 2)))
-                raise HMTError("Updating P matrix has gone wrong.")
-
-
-        ## Update mu
-        self.mus = (self.sum(('xi', 'x'), func=lambda xi, x: np.outer(xi, x)).T / xi_sum).T
-
-        ## Update sigma using updated mu
-        self.sigmas = self.sum(
-            ('xi', 'x'),
-            func=lambda xi, x: (rowwise_outer(x - self.mus, x - self.mus).T * xi).T
-            )
-        # self.sigmas = self.root.sigma_update_sum()
-        self.sigmas = (self.sigmas.T / xi_sum).T
-
-        if not np.allclose(self.sigmas, np.transpose(self.sigmas, axes=(0, 2, 1))):
-            raise HMTError("Sigma should be symmetric")
-
+        self.loglikelihood = 0
         
-        eigs = np.linalg.eigvals(self.sigmas)
-        if (eigs < 0).any() or np.isclose(eigs, 0).any():
-            # print(f"Iteration {self.it}")
-            # print(np.linalg.eigvals(self.sigmas), '\n')
-            raise HMTError("Sigma should be positive definite")
-
-            # Use psuedo determinant
-            # print(self.sigmas)
-            # print(eigs)
-            # self.detsigma = np.prod(np.where(eigs > 1.0e-8, eigs, 1), axis=1)
-            # print(self.detsigma)
-            # Use pseudo inverse
-            # self.sigmainv = np.linalg.pinv(self.sigmas)
-        # else:
-        self.detsigma = np.linalg.det(self.sigmas)
-        self.sigmainv = np.linalg.inv(self.sigmas)
-
-
-    def EMstep(self):
-        log_lk = self.Estep()
-        self.Mstep()
-        return log_lk
-    
-
-    """ =========================== Variational Bayesian Algorithm =========================== """
-
-    
-    def vb_init_hyperparams(self):
-        # Setting initial dirichlet weights to 1 is equivalent to uniform probabilities
-        # i.e. a flat prior
-        self.prior_init_s_weights = np.full(self.n_hidden, 1)
-        self.init_s_weights = self.prior_init_s_weights.copy()
-
-        self.prior_P_weights = np.full((self.n_hidden, self.n_hidden, self.n_hidden), 1)
-        self.P_weights = self.prior_P_weights.copy()
-
-        # self.mis = np.random.randn(self.n_hidden, self.n_obs)
-        # self.prior_mis = np.zeros((self.n_hidden, self.n_obs))
-        mean = self.mean('x')
-        self.prior_mis = np.array([mean for _ in range(self.n_hidden)])
-        if self.prior_mis.ndim == 1:
-            self.prior_mis = self.prior_mis.reshape(-1, 1)
-        self.mis = self.prior_mis.copy()
-
-        # self.prior_betas = np.(self.n_hidden, 1/self.n_hidden)
-        self.prior_betas = np.zeros(self.n_hidden)
-        self.betas = self.prior_betas.copy()
-
-        # Precision hyperparameters
-        self.prior_sigma_dof = np.full(self.n_hidden, 1)
-        self.sigma_dof = self.prior_sigma_dof.copy()
-
-        # self.prior_sigma_Winv = np.stack([np.eye(self.n_obs) for _ in range(self.n_hidden)])
-        
-        sample_cov = self.cov()
-        if not isinstance(sample_cov, np.ndarray):
-            prior_W = np.array([sample_cov for _ in range(self.n_hidden)]).reshape(-1, 1, 1)
+        self.root.s_distr = 1.0 * self.init_s_distr
+        if self.sister_dep:
+            self.root.calculate_sd_s_distr(drec=True)
+            self.root.sd_upward_pass(urec=True)
+            self.root.sd_downward_pass(drec=True)
         else:
-            prior_W = np.stack([sample_cov for _ in range(self.n_hidden)])
+            self.root.calculate_s_distr(drec=True)
+            self.root.upward_pass(urec=True)
+            self.root.downward_pass(drec=True)
         
-        # Educated guess
-        self.prior_sigma_Winv = np.linalg.inv(prior_W)
+        return self.loglikelihood
 
-        # Flat prior
-        # self.prior_sigma_Winv = np.zeros((self.n_hidden, self.n_obs, self.n_obs))
 
-        self.sigma_Winv = self.prior_sigma_Winv.copy()
-
+    def update_init_s_distr(self):
+        self.init_s_distr = self.root.xi.copy()
     
-    def vb_parameter_update(self):
-        # Update initial S distribution
-        self.init_s_distr = np.exp(digamma(self.init_s_weights) - digamma(self.init_s_weights.sum()))
-        self.init_s_distr /= self.init_s_distr.sum()
-        if not np.allclose(np.sum(self.init_s_distr), 1):
-            print(self.init_s_distr)
-            raise HMTError("VB update of init_s_distr has gone wrong")
-        
-        # Update P
-        self.P = np.exp((digamma(self.P_weights).T - digamma(self.P_weights.sum(axis=(1, 2)))).T)
-        self.P = (self.P.T / self.P.sum(axis=(1, 2))).T
-        if not np.allclose(np.sum(self.P, axis=(1, 2)), 1):
-            print(np.sum(self.P, axis=(1, 2)))
-            raise HMTError("VB update of P matrix has gone wrong.")
-        
-        # # Update mu
-        self.mus = self.mis
 
-        # # Update sigmas
-        self.sigmas = (self.sigma_Winv.T / self.sigma_dof).T
-
-        if not np.allclose(self.sigmas, np.transpose(self.sigmas, axes=(0, 2, 1))):
-            raise HMTError("Sigma should be symmetric")
-        
-        eigs = np.linalg.eigvals(self.sigmas)
-        if (eigs < 0).any() or np.isclose(eigs, 0).any():
-            # print(f"Iteration {self.it}")
-            # print(np.linalg.eigvals(self.sigmas), '\n')
-            raise HMTError("Sigma should be positive definite")
-        
-        self.sigmainv = np.linalg.inv(self.sigmas)
-        self.detsigma = np.linalg.det(self.sigmas)
-
-
-    def vb_Estep(self):
-        # Update model parameters
-        self.vb_parameter_update()
-        # Perfom normal E step
-        loglk = self.Estep()
-        return loglk
-
-
-    def vb_Mstep(self):
-        xi_sum = self.sum('xi')
-        xi_f_sum = self.sum('xi_f')
-        xi_x_T_sum = self.sum(('xi', 'x'), np.outer)
-        x_bar = (xi_x_T_sum.T / xi_sum).T
-
-        # Update initial S distribution weights
-        self.init_s_weights = self.prior_init_s_weights + xi_sum
-
-        # Update P weights
-        self.P_weights = self.prior_P_weights + xi_f_sum
-        # print(self.P_weights)
-
-        # Update mu distribution parameters
-        self.betas = xi_sum + self.prior_betas
-        self.mis = (self.prior_mis.T * self.prior_betas).T + xi_x_T_sum
-        self.mis = (self.mis.T / self.betas).T
-
-        # Update sigma distribution parameters
-        self.sigma_dof = self.prior_sigma_dof + xi_sum
-        self.sigma_Winv = self.prior_sigma_Winv + self.sum(
-            ('xi', 'x'),
-            func=lambda xi, x: (rowwise_outer(x - x_bar, x - x_bar).T * xi).T
-            )
-        self.sigma_Winv += (
-            rowwise_outer(x_bar - self.prior_mis, x_bar - self.prior_mis).T * 
-            (self.prior_betas * xi_sum) / (self.prior_betas + xi_sum)
-            ).T
-
-
-    def vb_EMstep(self):
-        loglk = self.vb_Estep()
-        self.vb_Mstep()
-        return loglk
+    def mother_xi_sum(self):
+        return self.root.mother_xi_sum()
     
-    " ====== End of Variational Bayes ====== "
+
+    def xi_null_sum(self, total=None):
+        if total is None:
+            total = np.zeros((self.n_obs, self.n_hidden))
+        self.root.xi_null_sum(total)
+        return total
 
 
-    def train(self, tol, maxits, store_log_lks=False, permute=True, overwrite_params=False):
-        if overwrite_params:
-            self.clear_params()
-        self.init_params()
-        self.it = 0
-        prev_log_lk = self.EMstep()
-        self.it += 1
-        curr_log_lk = self.EMstep()
-        self.it += 1
-        if store_log_lks:
-            log_lks = np.zeros(maxits)
-            log_lks[:2] = prev_log_lk, curr_log_lk
+    def clean(self):
+        self.root.clean()
 
-        it = 2
+    def sample(self, N, p, root_id=1, has_death=False):
+        s = np.random.choice(np.arange(self.n_hidden), p=self.init_s_distr)
+        if has_death:
+            death, obs = self.emission_distr.sample(s)
+        else:            
+            obs = self.emission_distr.sample(s)
+        if self.n_obs == 1:
+            obs = float(obs)
+        self.root = HMNode(root_id, observed=obs, hmmodel=self, s=s)
+        if has_death:
+            self.root.d = death
+            self.leaves.append(self.root)
+            if death is not None:
+                return
+        self.root.sample(N, p, has_death=has_death) # With death we will have fewer than N cells
 
-        while abs((curr_log_lk - prev_log_lk) / prev_log_lk) > tol and it < maxits:
-            prev_log_lk = curr_log_lk
-            curr_log_lk = self.EMstep()
-            self.it += 1
-            if store_log_lks:
-                log_lks[it] = curr_log_lk
-            it += 1
+    def sample_with_death(self, N, p, root_id=1):
+        s = np.random.choice(np.arange(self.n_hidden), p=self.init_s_distr)
+        obs = self.emission_distr.sample(s)
+        if self.n_obs == 1:
+            obs = float(obs)
+        self.root = HMNode(root_id, observed=obs, hmmodel=self, s=s)
+        self.root.sample_with_death(N, p)
+    
 
-        if permute and self.root.s is not None:
-            start = default_timer()
-            self.permute()
-            stop = default_timer()
-            self.time[-1] = stop - start
+    """" ################# Input / Output ################# """
+    
 
-        if store_log_lks:
-            return it, log_lks[:it]
-        return it
+    def to_numpy(self, attrs=None):
+        has_true_s = self.root.s is not None
+        n_attrs = len(attrs) if attrs is not None else 0
+        # Make an empty array with n_nodes rows, and the columns
+        # [id, mother_id, x_0, x_1, ..., x_(n_obs), true_hidden_state (if known), attrs]
+        X = np.zeros((len(self), 2 + self.n_obs + has_true_s + n_attrs), dtype=object)
+        # dtype=object allows strings for the ids
+        
+        queue = [self.root]
+        i = 0
+        while queue:
+            node = queue.pop(0)
+            X[i, 0] = node.id
+            X[i, 1] = node.mother.id if node.mother is not None else np.nan
+            X[i, 2 : 2 + self.n_obs] = node.x
+            if has_true_s:
+                X[i, 2 + self.n_obs] = node.s
+            if attrs is not None:
+                for pos, attr in enumerate(attrs):
+                    node_attr = getattr(node, attr)
+                    X[i, 2 + self.n_obs + has_true_s + pos] = node_attr
+
+            i += 1
+            if node.d0 is not None:
+                queue.append(node.d0)
+            if node.d1 is not None:
+                queue.append(node.d1)
+        return X
+
+
+    def to_pandas(self, attrs=None):
+        ndarr = self.to_numpy(attrs=attrs)
+        
+        column_names = ['cell_id', 'mother_id'] + [f'x{i}' for i in range(self.n_obs)]
+        if self.root.s is not None:
+            column_names.append('s')
+        
+        if attrs is not None:
+            column_names += attrs
+        
+        df = pd.DataFrame(
+            data=ndarr,
+            columns=column_names
+        )
+        if self.root.s is not None:
+            df["s"] = df["s"].astype('Int64')
+        if not isinstance(self.root.id, str):
+            df[["cell_id", "mother_id"]] = df[["cell_id", "mother_id"]].astype('Int64')
+        return df
+
+
+    def to_csv(self, path, attrs=None, **kwargs):
+        df = self.to_pandas(attrs=attrs)
+        df.to_csv(path, index=False, **kwargs)
+    
+
+    @staticmethod
+    def from_numpy(X, n_hidden, n_obs, has_true_s, obs_func=None):
+        tree = HMTree(n_hidden, n_obs)
+        # Assumes root is the first line in the dataset
+        root_data = X[0]
+        obs = root_data[2 : 2 + tree.n_obs].astype(float)
+        if obs_func is not None:
+            obs = obs_func(obs)
+
+        # Initialise root
+        tree.root = HMNode(
+            node_id=root_data[0],
+            observed=obs,
+            hmmodel=tree,
+            s=root_data[-1] if has_true_s else None
+        )
+        
+        # Add daughters recursively
+        tree.root.from_numpy(X=X, has_true_s=has_true_s, obs_func=obs_func)
+
+        # Find leaf nodes
+        tree.leaves = tree.root.get_leaves()
+        return tree
+
+
+    @staticmethod
+    def from_pandas(df, n_hidden, n_obs, obs_func=None):
+        has_true_s = "s" in df.columns.tolist()
+        ndarr = df.to_numpy(na_value=np.nan)
+        return HMTree.from_numpy(ndarr, n_hidden, n_obs, has_true_s, obs_func=obs_func)
+
+
+    @staticmethod
+    def from_csv(path, n_hidden, n_obs, obs_func=None, **csv_kwargs):
+        df = pd.read_csv(path, **csv_kwargs)
+        return HMTree.from_pandas(df, n_hidden, n_obs, obs_func=obs_func)
+    
+    """ ##### Accuracy + Permutations ##### """
 
     def extract_ml_s(self):
         if self.sister_dep:
-            self.root.sd_extract_ml_s(drec=True)
+            self.root.sd_extract_ml_s(d_drec=True)
         else:
-            self.root.extract_ml_s(drec=True)
+            self.root.extract_ml_s(d_drec=True)
 
 
     def best_permutation(self):
@@ -1101,10 +1503,6 @@ class HMTree(Tree, HMModel):
                 best_acc = acc
                 best_perm = perm
         return best_acc, best_perm
-
-
-    def permute_ml_s(self, perm):
-        self.apply(lambda ml_s: perm[ml_s], 'ml_s')
 
 
     def predict_hidden_states(self):
@@ -1157,268 +1555,294 @@ class HMTree(Tree, HMModel):
                 r[i] /= (n - 1) * d0_std * d1_std
 
         return r
-    
-
-    def xi_null_sum(self, total):
-        self.root.xi_null_sum(total)
 
 
-    def clear_params(self):
-        super().clear_params()
-        self.root.clean()
-
-
-    def number_estimated_parameters(self):
-        n, r = self.n_obs, self.n_hidden
-
-        # Initial distribution
-        total = r - 1
-
-        # Mu
-        total += n * r
-
-        # Sigma
-        total += r * n * (n + 1) / 2
-
-        # Transition matrix
-        if not self.sister_dep:
-            return total + r * (r - 1)
-        # Sister dependent
-        if self.daughter_order:
-            return total + r * (r ** 2 - 1)
-        # Sister dependent without daughter order
-        return total + r * (r ** 2 + r - 2) / 2
-    
-
-    def sample(self, N, p, root_id=1):
-        s = np.random.choice(np.arange(self.n_hidden), p=self.init_s_distr)
-        x = np.squeeze(np.random.multivariate_normal(self.mus[s], self.sigmas[s], 1))
-        if self.n_obs == 1:
-            x = float(x)
-        self.root = HMNode(root_id, observed=x, tree=self, s=s)
-        self.root.sample(N, p)
-    
-
-    # def sample_both(self, N, p):
-    #     tree = HMTree(self.n_hidden, self.n_obs, self.sister_dep, self.daughter_order)
-    #     s = np.random.choice(np.arange(self.n_hidden), p=self.init_s_distr)
-    #     x = np.squeeze(np.random.multivariate_normal(self.mus[s], self.sigmas[s], 1))
-    #     self.root = SDHMNode(1, observed=x, tree=self, s=s)
-    #     tree.root = HMNode(1, observed=x, tree=tree, s=s)
-    #     self.root.sample(N, p, tree.root)
-    #     return tree
-
-
-class HMForest(Forest, HMModel):
+class HMForest(HMModel, Forest):
     """
     Class for a group of hidden Markov trees that can be trained as a group or
     individually. See HMTree for more details about training and [2] for more details
     about ensemble updates.
-
-    Attributes
-    ----------
-    n_hidden, n_obs: int
-        Number of hidden states and observed values per node
-    sister_dep, daughter_order: bool
-        Indicates whether to model data with sister dependence or not. If 
-        sister dependence is true, daughter_order can be set to true if cells
-        have uneven divisions - see [2].
-    
-    Methods
-    -------
-    update_trees()
-        Ensures all trees have the same parameters as the forest (used for
-        ensemble training)
 
     References
     ----------
     [1]
     [2] - Me :)
     """
-    def __init__(self, n_hidden, n_obs, sister_dep=True, daughter_order=False):
-        tree_kwargs = {
-            "n_hidden" : n_hidden,
-            "n_obs" : n_obs,
-            "sister_dep" : sister_dep,
-            "daughter_order" : daughter_order
-        }
-        super().__init__(HMTree, HMNode, tree_kwargs)
+    def __init__(self, *hmm_args, **hmm_kwargs):
+        super().__init__(*hmm_args, **hmm_kwargs)
 
-        # Model parameters
-        self.n_hidden = n_hidden
-        self.n_obs = n_obs
-
-        self.sister_dep = sister_dep
-        self.daughter_order = daughter_order
-
-        # TODO implement automatic test or specify as parameter
-        self.has_null = True
-
-        # Tree Parameters
-        self.init_s_distr = None
-        self.P = None
-        self.emit_mat = None
-        self.mus = None
-        self.sigmas = None
-        self.sigmainv = None
-        self.detsigma = None
-        self.loglikelihood = None
-
-
-    def update_trees(self):
-        for tree in self.trees:
-            tree.n_hidden = self.n_hidden
-            tree.n_obs = self.n_obs
-            tree.sister_dep = self.sister_dep
-            tree.daughter_order = self.daughter_order
-            tree.set_params(**self.get_params())
     
-
-    def set_params(self, init_s_distr=None, P=None, emit_mat=None, mus=None,
-                         sigmas=None, sigmainv=None, detsigma=None, **unused):
-        super().set_params(init_s_distr, P, emit_mat, mus, sigmas, sigmainv, detsigma, **unused)
-        self.update_trees()
-    
-
-    def clear_params(self):
-        super().clear_params()
-        for tree in self.trees:
-            tree.clear_params()
-
-
-    def init_params(self, training='ensemble'):
-        if training == 'ensemble':
-            # Initialise parameters and ensure all trees have same parameters
-            super().init_params()
-            self.update_trees()
-            return
-        if training == 'individual':
-            # Initialise parameters on each tree individually
-            for tree in self.trees:
-                tree.init_params()
-            return
-        raise HMTError("Invalid training option, options are 'ensemble' and 'individual'")
-
-
     def Estep(self):
+        # Handle Errors
+        if self.init_s_distr is None:
+            raise HMTError('Forest has no initial S distribution.')
+        if self.P is None:
+            raise HMTError('Forest has no transition matrix P.')
+        if self.emission_distr is None:
+            raise HMTError('Forest has no emission distribution.')
+        
         self.loglikelihood = 0
-        for tree in self.trees:
-            self.loglikelihood += tree.Estep()
-        return self.loglikelihood
-    
 
-    def Mstep(self):
-        self.init_s_distr = np.mean([tree.root.xi for tree in self.trees], axis=0)
-
-        xi_sum = self.sum('xi')
-
-        if self.has_null:
-            xi_null_sum = np.zeros((self.n_obs, self.n_hidden))
-            for tree in self.trees:
-                tree.xi_null_sum(xi_null_sum)
-
-        leaf_sum = 0
-        for tree in self.trees:
-            leaf_sum += np.sum([l.xi for l in tree.leaves], axis=0)
-        
-        if self.P.ndim == 2:
-            m_d_xi_sum = self.sum('m_d_xi')
-            m_d_xi_sum = np.sum([tree.sum('m_d_xi') for tree in self.trees], axis=0)
-            mother_xi_sum = np.sum([tree.root.mother_xi_sum() for tree in self.trees], axis=0)
-            self.P = (m_d_xi_sum.T / mother_xi_sum).T
-            if not np.allclose(np.sum(self.P, axis=1), 1):
-                print(np.sum(self.P, axis=1))
-                raise HMTError("Updating P matrix has gone wrong.")
-        if self.P.ndim == 3:
-            xi_f_sum = self.sum('xi_f')
-            if self.daughter_order:
-                # Symmetry not enforced
-                self.P = (xi_f_sum.T / (xi_sum - leaf_sum)).T
+        for tree_root in self.roots:    
+            tree_root.s_distr = 1.0 * self.init_s_distr
+            if self.sister_dep:
+                tree_root.calculate_sd_s_distr(d_drec=True)
+                tree_root.sd_upward_pass(d_urec=True)
+                tree_root.sd_downward_pass(d_drec=True)
             else:
-                # Enforce symmetry
-                xi_f_sum = (xi_f_sum + np.transpose(xi_f_sum, axes=(0, 2, 1))) / 2
-                self.P = (xi_f_sum.T / (xi_sum - leaf_sum)).T
-                if not np.allclose(self.P, np.transpose(self.P, axes=(0, 2, 1))):
-                    raise HMTError("P not symmetric in update step")
-            if not np.allclose(np.sum(self.P, axis=(1, 2)), 1):
-                print(np.sum(self.P, axis=(1, 2)))
-                raise HMTError("Updating P matrix has gone wrong.")
+                tree_root.calculate_s_distr(d_drec=True)
+                tree_root.upward_pass(d_urec=True)
+                tree_root.downward_pass(d_drec=True)
         
-        # Update mu
-        self.mus = self.sum(('xi', 'x'), func=lambda xi, x: np.outer(xi, x))
-        if self.has_null:
-            for m in range(self.n_obs):
-                self.mus[:, m] /= xi_null_sum[m]
-        else:
-            self.mus = (self.mus.T / xi_sum).T
+        return self.loglikelihood
 
-        # Update sigma using updated mu
-        self.sigmas = self.sum(
-            ('xi', 'x'),
-            func=lambda xi, x: (rowwise_outer(x - self.mus, x - self.mus).T * xi).T
+
+    def xi_null_sum(self):
+        # Easier to get sum using n_obs x n_hidden
+        xi_null_sum = np.zeros((self.n_obs, self.n_hidden))
+        for root in self.roots:
+            root.xi_null_sum(xi_null_sum)
+        # Easier to work with n_hidden x n_obs from here
+        return xi_null_sum.T 
+
+
+    def update_init_s_distr(self):
+        self.init_s_distr = np.mean([root.xi for root in self.roots], axis=0)
+    
+
+    def mother_xi_sum(self):
+        return np.sum([root.mother_xi_sum() for root in self.roots], axis=0)
+    
+
+    def clean(self):
+        for root in self.roots:
+            root.clean()
+    
+
+    def sample(self, n_trees, n_nodes, dropout, has_death=False):
+        self.roots = [] # Clear any current trees in the forest
+        n_nodes_remaining = 0
+        for i in range(n_trees):
+            s = np.random.choice(np.arange(self.n_hidden), p=self.init_s_distr)
+            if has_death:
+                death, obs = self.emission_distr.sample(s)
+            else:
+                obs = self.emission_distr.sample(s)
+            if self.n_obs == 1:
+                obs = float(obs)
+            root = HMNode(f"t{i+1}-1", observed=obs, hmmodel=self, s=s)
+            if has_death:
+                root.d = death
+                if death:
+                    self.roots.append(root)
+                    self.leaves.append(root)
+                    n_nodes_remaining += n_nodes - 1
+                    continue
+            n_nodes_to_add = root.sample(n_nodes, dropout, has_death=has_death)
+            # print(n_nodes_to_add)
+            n_nodes_remaining += n_nodes_to_add
+            self.roots.append(root)
+
+        # Sample remaining nodes that weren't added to original trees due to death
+        while n_nodes_remaining > 0:
+            # TODO doesn't work when we go in to this while loop a second time
+            # print(n_nodes_remaining)
+            i += 1
+            if i > 10:
+                return
+            s = np.random.choice(np.arange(self.n_hidden), p=self.init_s_distr)
+            if has_death:
+                death, obs = self.emission_distr.sample(s)
+            else:
+                obs = self.emission_distr.sample(s)
+            if self.n_obs == 1:
+                obs = float(obs)
+            root = HMNode(f"t{i+1}-1", observed=obs, hmmodel=self, s=s)
+            if has_death:
+                root.d = death
+                if death:
+                    self.roots.append(root)
+                    self.leaves.append(root)
+                    n_nodes_remaining += n_nodes - 1
+                    continue
+            n_nodes_remaining = root.sample(n_nodes_remaining, dropout, has_death=has_death)
+            self.roots.append(root)
+
+    """ =================== Input / Output =================== """
+
+    def to_numpy(self, attrs=None):
+        has_true_s = self.roots[0].s is not None
+        
+        # Make an empty array with n_nodes rows, and the columns
+        # [id, mother_id, x_0, x_1, ..., x_(n_obs), true_hidden_state (if known)]
+        n_nodes = sum([len(tree) for tree in self.roots])
+        n_attrs = len(attrs) if attrs is not None else 0
+        X = np.zeros((n_nodes, 2 + self.n_obs + has_true_s + n_attrs), dtype=object)
+        
+        i = 0
+        for root in self.roots:
+            queue = [root]
+            while queue:
+                node = queue.pop(0)
+                X[i, 0] = node.id
+                X[i, 1] = node.mother.id if node.mother is not None else np.nan
+                X[i, 2 : 2 + self.n_obs] = node.x
+                if has_true_s:
+                    X[i, 2 + self.n_obs] = node.s
+                if attrs is not None:
+                    for pos, attr in enumerate(attrs):
+                        node_attr = getattr(node, attr)
+                        X[i, 2 + self.n_obs + has_true_s + pos] = node_attr
+
+                i += 1
+                if node.d0 is not None:
+                    queue.append(node.d0)
+                if node.d1 is not None:
+                    queue.append(node.d1)
+        return X
+
+
+    def to_pandas(self, attrs=None):
+        ndarr = self.to_numpy(attrs=attrs)
+        
+        column_names = ['cell_id', 'mother_id'] + [f'x{i}' for i in range(self.n_obs)]
+        if self.roots[0].s is not None:
+            column_names.append('S')
+        
+        if attrs is not None:
+            column_names += attrs
+        
+        df = pd.DataFrame(
+            data=ndarr,
+            columns=column_names
+        )
+        if self.roots[0].s is not None:
+            df["S"] = df["S"].astype('Int64')
+        if not isinstance(self.roots[0].id, str):
+            df[["cell_id", "mother_id"]] = df[["cell_id", "mother_id"]].astype('Int64')
+        return df
+
+
+    def to_csv(self, path, attrs=None, **kwargs):
+        df = self.to_pandas(attrs=attrs)
+        df.to_csv(path, index=False, **kwargs)
+    
+
+    @staticmethod
+    def from_numpy(X, n_hidden, n_obs, inds_dict, obs_func=None):
+        """
+        Assumes the array X is in the format:
+
+        [tree1, root1, nan, obs, hidden (if known)]
+        [tree1, cell, mother, obs, hidden (if known)]
+        [tree1, cell, mother, obs, hidden (if known)]
+        ...
+        [tree2, root2, nan, obs, hidden (if known)]
+        [tree2, cell, mother, obs, hidden (if known)]
+        ...
+        [tree3, root3, nan, obs, hidden (if known)]
+        [tree3, cell, mother, obs, hidden (if known)]
+        ...
+
+        NOTE: The tree ID is not necesarily required
+        """
+        forest = HMForest(n_hidden, n_obs)
+
+        if inds_dict['tree_id'] is not None:
+            for tree_id in np.unique(X[:, inds_dict['tree_id']]):
+                tree_X = X[X[:, 0] == tree_id, 1:]
+                root_data = tree_X[0]
+                obs = root_data[inds_dict['obs']].astype(float)
+                if obs_func is not None:
+                    obs = obs_func(obs)
+                if inds_dict['C'] is not None:
+                    censoring_inds = eval(inds_dict['C'])
+                    if censoring_inds:
+                        c = obs[censoring_inds]
+                        obs[censoring_inds] = np.nan
+
+                # Initialise root
+                root = HMNode(
+                    node_id=root_data[0],
+                    observed=obs,
+                    hmmodel=forest,
+                    hidden_state=root_data[inds_dict['hidden_state']] if inds_dict['hidden_state'] is not None else None,
+                    d=root_data[inds_dict['D']] if inds_dict['D'] is not None else None
+                )
+                return root
+                # Add daughters recursively
+                root.from_numpy(X=tree_X, has_true_s=has_true_s, obs_func=obs_func)
+
+                # Add tree root to forest
+                forest.roots.append(root)
+                forest.leaves += root.get_leaves()
+            return forest
+        
+        # Without tree IDs given, check for nodes without mothers - these are the tree roots
+        root_inds = list(np.where(pd.isna(X[:, 1]))[0])
+        if not root_inds:
+            # Check for nodes where cell_id == mother_id
+            root_inds = list(np.where(X[:, 0] == X[:, 1])[0])
+
+        for curr_ind, next_ind in zip(root_inds, root_inds[1:] + [None]):
+            tree_X = X[curr_ind : next_ind]
+            root_data = tree_X[0]
+            obs = root_data[2 : 2 + forest.n_obs].astype(float)
+            if obs_func is not None:
+                obs = obs_func(obs)
+            # Initialise root
+            root = HMNode(
+                node_id=root_data[0],
+                observed=obs,
+                hmmodel=forest,
+                s=root_data[-1] if has_true_s else None
             )
-        if self.has_null:
-            for m in range(self.n_obs):
-                scale = xi_null_sum[m]
-                self.sigmas[:, m, :] /= scale.reshape(-1, 1)
-                self.sigmas[:, m, m] *= scale
-                self.sigmas[:, :, m] /= scale.reshape(-1, 1)
-        else:
-            self.sigmas = (self.sigmas.T / xi_sum).T
+            # Add daughters recursively
+            root.from_numpy(X=X, has_true_s=has_true_s, obs_func=obs_func)
 
-        if not (np.linalg.eigvals(self.sigmas) > 0).all():
-            print(np.linalg.eigvals(self.sigmas), '\n')
-            raise HMTError("Sigma should be positive definite")
-
-        if not np.allclose(self.sigmas, np.transpose(self.sigmas, axes=(0, 2, 1))):
-            raise HMTError("Sigma should be symmetric")
-
-        self.sigmainv = np.linalg.inv(self.sigmas)
-        self.detsigma = np.linalg.det(self.sigmas)
-
-        self.update_trees()
-
-    
-    def EMstep(self, training='ensemble'):
-        if training == 'ensemble':
-            loglikelihood = self.Estep()
-            self.Mstep()
-            return loglikelihood
-        if training == 'individual':
-            self.loglikelihood = 0
-            for tree in self.trees:
-                self.loglikelihood += tree.EMstep()
-            return self.loglikelihood
-        raise HMTError("Invalid training option, options are 'ensemble' and 'individual'")
-
-
-    def train(self, tol, maxits, training='ensemble', store_log_lks=False, overwrite_params=False, permute=False):
-        if overwrite_params:
-            self.clear_params()
-        self.init_params(training)
-
-        prev_log_lk = self.EMstep(training)
-        curr_log_lk = self.EMstep(training)
-
-        if store_log_lks:
-            log_lks = np.zeros(maxits)
-            log_lks[:2] = prev_log_lk, curr_log_lk
-
-        it = 2
-
-        while abs((curr_log_lk - prev_log_lk) / prev_log_lk) > tol:
-            prev_log_lk = curr_log_lk
-            curr_log_lk = self.EMstep(training)
-            if store_log_lks:
-                log_lks[it] = curr_log_lk
-            it += 1
-
-        if store_log_lks:
-            return it, log_lks[:it]    
+            # Add tree root to forest
+            forest.roots.append(root)
+            forest.leaves += root.get_leaves()
         
-        return it
-
+        return forest
     
+    def add_nodes_from_pandas(self, df, obs_cols, obs_func=None):
+        for tree_id in df["Tree ID"].unique():
+            tree_df = df[df["Tree ID"] == tree_id].reset_index(drop=True)
+            ## NOTE assumes the root is the first row in the dataframe
+
+            # Initialise root and read in tree
+            root = HMNode.from_pandas_row(tree_df.iloc[0], obs_cols=obs_cols, hmmodel=self, obs_func=obs_func)
+            root.from_pandas(df=tree_df, obs_cols=obs_cols, obs_func=obs_func)
+            self.roots.append(root)
+            self.leaves += root.get_leaves()
+
+    @staticmethod
+    def from_pandas(df, n_hidden, n_obs, obs_cols, obs_func=None):
+        cols = df.columns.tolist()
+        assert set(obs_cols).issubset(set(cols)), "obs_cols must be a subset of the dataframe columns"
+        
+        forest = HMForest(n_hidden, n_obs)
+        forest.add_nodes_from_pandas(df=df, obs_cols=obs_cols, obs_func=obs_func)
+        return forest
+
+
+    @staticmethod
+    def from_csv(path, n_hidden, n_obs, obs_cols, obs_func=None, **csv_kwargs):
+        df = pd.read_csv(path, **csv_kwargs)
+        return HMForest.from_pandas(df=df, n_hidden=n_hidden, n_obs=n_obs, obs_cols=obs_cols, obs_func=obs_func)
+
+
+    """ ##### Accuracy + Permutations ##### """
+
+    def extract_ml_s(self):
+        if self.sister_dep:
+            for root in self.roots:
+                root.sd_extract_ml_s(d_drec=True)
+        else:
+            for root in self.roots:
+                root.extract_ml_s(d_drec=True)
+
     def predict_hidden_states(self):
         """
         The main function.
@@ -1432,21 +1856,17 @@ class HMForest(Forest, HMModel):
         self.Estep()
 
         # Extract MLE S values
-        for tree in self.trees:
-            if self.sister_dep:
-                tree.root.sd_extract_ml_s(drec=True)
-            else:
-                tree.root.extract_ml_s(drec=True)
+        self.extract_ml_s()
 
-        if self.trees[0].root.s is not None:
+        if self.roots[0].s is not None:
             # Permute
             best_acc = self.permute()
             return best_acc
     
     
     def acc(self):
-        n_acc = np.sum([tree.root.n_accurate_nodes() for tree in self.trees], axis=0)
-        n_tot = np.sum([len(tree) for tree in self.trees], axis=0)
+        n_acc = np.sum([root.n_accurate_nodes() for root in self.roots], axis=0)
+        n_tot = len(self)
         return n_acc / n_tot
 
 
@@ -1457,32 +1877,26 @@ class HMForest(Forest, HMModel):
         # Calculate smoothed probabilities
         self.Estep()
         # Extract MLE S values
-        for tree in self.trees:
-            tree.extract_ml_s()
+        self.extract_ml_s()
 
 
         best_acc = self.acc()
         best_perm = None
         for perm in permutations(range(self.n_hidden)):
             # Apply permutation
-            for tree in self.trees:
-                tree.apply(lambda s: perm[s], 's')
+            for root in self.roots:
+                root.apply(lambda s: perm[s], 's', d_drec=True)
             
             # Find accuracy with this permutation
             acc = self.acc()
             
             # Apply inverse permutation
-            for tree in self.trees:
-                tree.apply(lambda s: np.argsort(perm)[s], 's')
+            for root in self.roots:
+                root.apply(lambda s: np.argsort(perm)[s], 's', d_drec=True)
             if acc > best_acc:
                 best_acc = acc
                 best_perm = perm
         return best_acc, best_perm
-    
-
-    def permute_ml_s(self, perm):
-        for tree in self.trees:
-            tree.permute_ml_s(perm)
 
 
     def sample_corr(self, measure="true_s"):
@@ -1490,9 +1904,11 @@ class HMForest(Forest, HMModel):
             raise HMTError("measure can be 'true_s' or 'ml_s'")
         s_list = []
 
-        for tree in self.trees:
-            tree.root.sample_corr(s_list, measure)
-        
+        for root in self.roots:
+            root.sample_corr(s_list, measure)
+
+        # TODO reimplement with to_numpy method
+
         # Array of state and daughter states for all nodes with 2 daughters
         s = np.array(s_list)
         # Initialise correlation array 
@@ -1516,18 +1932,3 @@ class HMForest(Forest, HMModel):
                 r[i] /= (n[i] - 1) * d0_std * d1_std
 
         return r, n
-
-
-    def sample(self, n_trees, n_nodes, dropout):
-        params = self.get_params()
-
-        tree0  = HMTree(self.n_hidden, self.n_obs, self.sister_dep, self.daughter_order)
-        tree0.set_params(**params)
-        tree0.sample(n_nodes, dropout, root_id=1)
-    
-        self.trees.append(tree0)
-        for i in range(n_trees - 1):
-            tree = HMTree(self.n_hidden, self.n_obs, self.sister_dep, self.daughter_order)
-            tree.set_params(**params)
-            tree.sample(n_nodes, dropout, root_id = 2 * tree0.leaves[i // 2].id + i%2)
-            self.trees.append(tree)
