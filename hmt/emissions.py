@@ -4,8 +4,8 @@ import numpy as np
 from scipy.special import gamma, loggamma
 from scipy.stats import multivariate_normal, norm, truncnorm
 # from scipy.stats import multivariate_normal
-from hmt.utils import rowwise_outer, div0, log_addition, log_subtraction
-from scipy.special import digamma, polygamma
+from hmt.utils import rowwise_outer, div0, log_addition, multivariate_digamma
+from scipy.special import digamma, polygamma, loggamma
 from sklearn.cluster import KMeans
 from sklearn.impute import SimpleImputer
 from hmt.exceptions import HMTError
@@ -17,39 +17,42 @@ class Emission:
     """
     Base class for emission distributions.
     """
-    def __init__(self, n_hidden, n_obs, hmmodel=None):
+    def __init__(self, n_hidden, n_obs, hmmodel=None, death_ind=None):
         self.n_hidden = n_hidden
         self.n_obs = n_obs
         self.hmmodel = hmmodel
         self.missing_pattern = {}
-        self.death_ind = None
+        self.death_ind = death_ind
         self.degenerate_states = []
-        self.generate_states = []
+        self.generate_states = list(range(n_hidden))
     
     def set_degenerate_state(self, degenerate_states):
-        if not degenerate_states:
+        degenerate_states = [degenerate_states] if isinstance(degenerate_states, int) else degenerate_states
+        if not len(degenerate_states):
             return
-        if isinstance(degenerate_states, int):
-            degenerate_states = [degenerate_states]
         self.degenerate_states = degenerate_states
         self.generate_states = tuple(set(range(self.n_hidden)).difference(degenerate_states))
+        self.generate_states = np.array(self.generate_states, dtype=int)
+        # print(self.generate_states)
         self.n_hidden -= len(degenerate_states)
+        assert self.n_hidden == len(self.generate_states)
+        assert self.n_hidden > 0
         self.update_emission()
 
     def update_emission(self):
         if not self.degenerate_states:
             return
         original_emission = self.emission
-        def degenerate_emission(self, *args, **kwargs):
+        def degenerate_emission(node):
             
-            p = np.zeros(self.hmmodel.n_hidden + len(self.degerate_states))
+            p = np.zeros(self.hmmodel.n_hidden)
             
-            p[self.generate_states] = original_emission(*args, **kwargs)
+            p[self.generate_states] = original_emission(node)
             return p
         self.emission = degenerate_emission
 
     def degenerate_state_prompt(self, degenerate_states):
-        print(f"Degenerate state(s) detected: {degenerate_states}")
+        # print(f"Degenerate state(s) detected: {degenerate_states} for death ind {self.death_ind}")
         self.set_degenerate_state(degenerate_states)
         return
         while True:
@@ -106,20 +109,21 @@ class Emission:
 
 
 class MVN(Emission):
-    def __init__(self, n_hidden, n_obs, mus=None, sigmas=None, hmmodel=None):
-        super().__init__(n_hidden, n_obs, hmmodel)
+    def __init__(self, n_hidden, n_obs, mus=None, sigmas=None, hmmodel=None, death_ind=None):
+        super().__init__(n_hidden, n_obs, hmmodel, death_ind)
         self.type = "ML"
         self.mus = mus
         self.sigmas = sigmas
+        self.reinit_its = []
         self.check_params()
         self.sigma_inv_det()
     
     def set_degenerate_state(self, degenerate_states):
         super().set_degenerate_state(degenerate_states)
-        self.mus = self.mus[self.generate_states, :]
-        self.sigmas = self.sigmas[self.generate_states, :, :]
-        self.sigmainv = self.sigmainv[self.generate_states, :, :]
-        self.detsigma = self.detsigma[self.generate_states, ...]
+        for attr in ['mus', 'sigmas', 'sigmainv', 'detsigma']:
+            attr_val = getattr(self, attr)
+            if attr_val is not None:
+                setattr(self, attr, attr_val[self.generate_states, ...])
         self.check_params()
         
 
@@ -140,7 +144,7 @@ class MVN(Emission):
     
 
     def kmeans_start(self):
-        X = self.hmmodel.to_numpy(attrs='x')[:, 2:2+self.n_obs]
+        X = self.hmmodel.to_numpy(include_ids=False)[:, :self.n_obs]
         # Impute any null values
         imp_mean = SimpleImputer(missing_values=np.nan, strategy='mean').fit(X)
         X = imp_mean.transform(X)
@@ -152,14 +156,16 @@ class MVN(Emission):
         self.sigmas = np.zeros((self.n_hidden, self.n_obs, self.n_obs))
         for r in range(self.n_hidden):
             self.sigmas[r] = np.cov(X[kmeans.labels_ == r], rowvar=False)
+            self.sigmas[r] += np.eye(self.n_obs)
         self.sigmas *= 5 # Scale up to avoid underflow errors
-        try:
-            self.sigmainv = np.linalg.inv(self.sigmas)
-            self.detsigma = np.linalg.det(self.sigmas)
-        except:
+        
+        if np.any(np.isclose(np.linalg.eigvals(self.sigmas), 0)):
             print([len(X[kmeans.labels_ == r]) for r in range(self.n_hidden)])
             print(self.sigmas)
             print(self.death_ind)
+        
+        self.sigmainv = np.linalg.inv(self.sigmas)
+        self.detsigma = np.linalg.det(self.sigmas)
     
 
     def random_start(self):
@@ -169,7 +175,7 @@ class MVN(Emission):
         
         if self.sigmas is None:
             if self.hmmodel is not None:
-                var = self.hmmodel.var()
+                var = self.hmmodel.var()[:self.n_obs]
             else:
                 var = np.ones(self.n_obs) # If no tree just use unit variance for each observation
             if not isinstance(var, np.ndarray):
@@ -179,16 +185,28 @@ class MVN(Emission):
             # self.sigmas = self.sigmas @ np.transpose(self.sigmas, axes=(0, 2, 1))
             eigs = np.linalg.eigvals(self.sigmas) if self.n_obs > 1 else self.sigmas
             if (eigs <= 0).any():
-                print(self.n_hidden, self.n_obs)
+                print(eigs)
                 print(self.sigmas)
                 raise HMTError("Initial sigma should be positive definite")
             if not np.allclose(self.sigmas, np.transpose(self.sigmas, axes=(0, 2, 1))):
-                print(self.n_hidden, self.n_obs)
                 print(self.sigmas)
                 raise HMTError("Initial sigma should be symmetric")
 
             self.sigmainv = np.linalg.inv(self.sigmas)
             self.detsigma = np.linalg.det(self.sigmas)
+
+    def reinit_params(self, eigs):
+        if len(self.reinit_its) >= 10:
+            raise HMTError("Normal Parameters reinitialised 10 times")
+        self.reinit_its.append(self.hmmodel.it)
+        collapsed_inds = np.where((eigs < 0) | np.isclose(eigs, 0))[0]
+        n_comps = len(collapsed_inds)
+        self.mus[collapsed_inds] = np.random.randn(n_comps, self.n_obs)
+        self.sigmas[collapsed_inds] = np.stack(
+            [np.eye(self.n_obs) for _ in range(n_comps)]
+            )
+        self.sigmas[collapsed_inds] *= 5 # TODO better heuristic here
+
 
 
     def init_params(self, init_method='kmeans'):
@@ -219,8 +237,8 @@ class MVN(Emission):
             if self.sigmas.shape[0] != self.n_hidden:
                 raise HMTError("Emission covaraince matrix must have shape rxnxn where r is the number of hidden states and n is the number of observed states")
             eigs = np.linalg.eigvals(self.sigmas) if self.n_obs > 1 else self.sigmas
-            if not (eigs > 0).all():
-                raise HMTError("Sigma should be positive definite")
+            if not (eigs > 0).all() or np.any(np.isclose(eigs, 0)):
+                raise HMTError(f"Sigma should be positive definite, {self.death_ind}")
 
             if self.n_obs > 1 and not np.allclose(self.sigmas, np.transpose(self.sigmas, axes=(0, 2, 1))):
                 raise HMTError("Sigma should be symmetric")
@@ -248,10 +266,10 @@ class MVN(Emission):
 
     def get_params(self):
         return {
-            'mus': self.mus,
-            'sigmas': self.sigmas,
-            'sigmainv': self.sigmainv,
-            'detsigma': self.detsigma
+            'mus': self.mus.copy() if self.mus is not None else None,
+            'sigmas': self.sigmas.copy() if self.sigmas is not None else None,
+            'sigmainv': self.sigmainv.copy() if self.sigmainv is not None else None,
+            'detsigma': self.detsigma.copy() if self.detsigma is not None else None
         }
     
 
@@ -260,6 +278,7 @@ class MVN(Emission):
         self.sigmas = None
         self.sigmainv = None
         self.detsigma = None
+        self.reinit_its = []
     
 
     def number_of_params(self):
@@ -355,7 +374,7 @@ class MVN(Emission):
         # return np.exp(logpdf - logsurvival)
     
     def survival_pdf(self, t):
-        raise NotImplementedError
+        raise ValueError("Should not be calling")
         # trunc_ind = np.where(t > -np.inf)[0].item()
         # trunc_val = t[trunc_ind]
         # return norm.sf(
@@ -378,33 +397,44 @@ class MVN(Emission):
             trunc_ind = np.where(t > -np.inf)[0]
             trunc_val = t[trunc_ind]
             if len(trunc_ind) > 1:
-                raise HMTError("Multiple truncation inds not supported (mathematically this is no longer lognomal)")
+                raise HMTError("Multiple truncation inds not supported (mathematically this is no longer normal)")
             if np.isnan(x[trunc_ind]):
                 if np.isnan(c[trunc_ind]):
                     raise HMTError(f"Null values can't be truncated: {x = }, {c = }, {t = }")
+                c = c.copy()
                 c[trunc_ind] = log_addition(c[trunc_ind], trunc_val)
             else:
+                x = x.copy()
                 x[trunc_ind] = log_addition(x[trunc_ind], trunc_val)
             denominator = norm.sf(
                 x=trunc_val,
                 loc=self.mus[:, trunc_ind],
                 scale=np.sqrt(self.sigmas[:, trunc_ind, trunc_ind])
-            )
+            ).squeeze()
         else:
             denominator = 1
-            
 
         assert x.shape == (self.n_obs, )
+        if np.isnan(x).all() and np.isnan(c).all():
+            raise ValueError
         if c is None or np.isnan(c).all():
-            if node.t is None or np.isnan(node.t).all():
-                return self.pdf(x)
-            return self.trunc_pdf(log_addition(x, node.t), node.t)
+            pdf = self.pdf(x) / denominator
+            # if not isinstance(denominator, int):
+            #     print(x)
+            #     print(self.pdf(x))
+            #     print(pdf)
+            assert pdf.shape == (self.n_hidden, )
+            return pdf
         
-        if node.t is not None and not np.isnan(node.t).all():
-            raise NotImplementedError("Observations with both censoring and truncation has not been implemented")
-
         nulls = np.argwhere(np.isnan(x)).flatten()
-        s21_s11inv = self.missing_pattern[tuple(nulls)]['s21_s11^-1']
+        try:
+            s21_s11inv = self.missing_pattern[tuple(nulls)]['s21_s11^-1']
+        except:
+            print(self.missing_pattern)
+            print(nulls)
+            print(node.x, node.d)
+            print(self.hmmodel.idx)
+            assert False
         cond_mus = self.mus[:, nulls] + np.einsum(
             'ijk,ik->ij', s21_s11inv, (x - self.mus)[:, ~np.isnan(x)]
             )
@@ -422,9 +452,13 @@ class MVN(Emission):
             )
         # print(cond_cdf)
         if np.isnan(x).all():
-            return cond_cdf
+            pdf = cond_cdf / denominator
+            assert pdf.shape == (self.n_hidden, )
+            return pdf
 
-        return cond_cdf * self.pdf(x)
+        pdf = cond_cdf * self.pdf(x) / denominator
+        assert pdf.shape == (self.n_hidden, )
+        return pdf
 
     def precalculate_matrices(self):
         """
@@ -440,12 +474,22 @@ class MVN(Emission):
             s22 = self.sigmas[np.ix_(hidden_idxs, nulls, nulls)]
             s21_s11inv_s12 = s @ self.sigmas[np.ix_(hidden_idxs, not_nulls, nulls)]
             self.missing_pattern[nulls]['Es22'] = s22 - s21_s11inv_s12
+    
+    def conditional_mean_cov(self, x):
+        # Calculate conditional mean and variance given observed values x
+        nulls = np.argwhere(np.isnan(x)).flatten()
+        s21_s11inv = self.missing_pattern[tuple(nulls)]['s21_s11^-1']
+        cond_mus = self.mus[:, nulls] + np.einsum(
+            'ijk,ik->ij', s21_s11inv, (x - self.mus)[:, ~np.isnan(x)]
+            )
+        cond_sigmas = self.missing_pattern[tuple(nulls)]['Es22']
+        return cond_mus, cond_sigmas
 
     def impute(self, xi, x, c=None, t=None, d=None):
         """
         Impute missing values in a single observation x_u using the conditional normal distribution
 
-        Returns E[x_u | observations] and E[S | observations] = E[x_u^Tx_u | observations] for each hidden state
+        Returns E[x | observations] and E[S | observations] = E[x x^T | observations] for each hidden state
 
         Args
         ----
@@ -458,58 +502,61 @@ class MVN(Emission):
         t: np.ndarray
             The truncation points
         """
-        ################# TRUNCATION #################
-        # Deal with this first as it is an additive constant that we can set to 0 if not used and move on
-        
-        x = x.copy()
-        
-        if t is not None and not np.isnan(t).all() and np.any(t > -np.inf):
-            x = log_addition(x, t)
-        
         x = x[:d] if d is not None and d else x
         c = c[:d] if c is not None and d is not None and d else c
         t = t[:d] if t is not None and d is not None and d else t
 
+        ################# TRUNCATION #################
+        # Deal with this first as it is an additive constant that we can set to 0 if not used and move on
+        if t is not None and not np.isnan(t).all() and np.any(t > -np.inf):
+            trunc_ind = np.where(t > -np.inf)[0]
+            trunc_val = t[trunc_ind]
+            if len(trunc_ind) > 1:
+                raise HMTError("Multiple truncation inds not supported (mathematically this is no longer normal)")
+            if np.isnan(x[trunc_ind]):
+                if np.isnan(c[trunc_ind]):
+                    raise HMTError(f"Null values can't be truncated: {x = }, {c = }, {t = }")
+                c = c.copy()
+                c[trunc_ind] = log_addition(c[trunc_ind], trunc_val)
+            else:
+                x = x.copy()
+                x[trunc_ind] = log_addition(x[trunc_ind], trunc_val)
+                # The truncation is accounted for when we calculate Hk and mk
+
         if not np.isnan(x).any(): # All values present
-            s = rowwise_outer(x - self.mus, x - self.mus)
-                
-            x = np.tile(x, (self.n_hidden, 1))
-            Ex = x 
-            Es = s
-            return (Ex.T * xi).T, (Es.T * xi).T
+            Es = rowwise_outer(x - self.mus, x - self.mus)
+            Ex = np.tile(x, (self.n_hidden, 1))
+            return Ex * xi[:, None], Es * xi[:, None, None]
         
         ################# MISSING #################
-        # If there is no censoring and just missing values
-        #TODO figure out how this works with censoring, looks like this is <y_m|y_o>, not <y_m|y_o, y_c>
-
         nulls = np.argwhere(np.isnan(x)).flatten()
+        cond_mus, cond_sigmas = self.conditional_mean_cov(x)
+        
         Ex = np.tile(x, (self.n_hidden, 1))
-
-        # Calculate conditional mean and variance given observed values x
-        s21_s11inv = self.missing_pattern[tuple(nulls)]['s21_s11^-1']
-        cond_mus = self.mus[:, nulls] + np.einsum(
-            'ijk,ik->ij', s21_s11inv, (x - self.mus)[:, ~np.isnan(x)]
-            )
-        cond_sigmas = self.missing_pattern[tuple(nulls)]['Es22']
         Ex[:, np.isnan(x)] = cond_mus
 
         if c is None or np.isnan(c).all():
+            # If there is no censoring and just missing values
             Es = rowwise_outer(Ex - self.mus, Ex - self.mus)
             Es[np.ix_(np.arange(self.n_hidden), nulls, nulls)] += cond_sigmas
-            return (Ex.T * xi).T, (Es.T * xi).T
-            # if res[0].shape != (self.n_hidden, self.n_obs):
-            #     raise HMTError("Error on 431")
-            # if res[1].shape != (self.n_hidden, self.n_obs, self.n_obs):
-            #     raise HMTError("Error on 433")
-            # return res
+            if np.any(Es.diagonal(axis1=1, axis2=2) < 0):
+                print(Es)
+                print(Es.diagonal(axis1=1, axis2=2))
+                print(cond_sigmas)
+                assert False
+            return Ex * xi[:, None], Es * xi[:, None, None]
         
         ################# CENSORING #################
         ## Impute with censoring values
+        # TODO figure out how this affects missing values, looks like this is <y_m|y_o>, not <y_m|y_o, y_c>
+        # NOTE missing is no censoring above or below, so F(a_k) = F(b_k) = 0 so no contribution, we can also see
+        # by imputing with / without c gives different values for missing values (comes from sigma_{ij} in paper) 
         c0 = c[np.isnan(x)] - cond_mus
-        censoring_inds = np.where(~np.isnan(c0[0]))[0]
-        if len(censoring_inds) > 1:
+        censoring_ind = np.where(~np.isnan(c0[0]))[0]
+        if len(censoring_ind) > 1:
             # Often we only have one censored value, so we can save time by avoiding these calculations
             raise NotImplementedError("Multiple censored values not implemented")
+        censoring_ind = censoring_ind.item()
 
         # Find the normalising constant numerically
         # TODO does not have to be multivariate, can just find the survival of univariate normal at censoring ind
@@ -521,19 +568,18 @@ class MVN(Emission):
                 mean=np.zeros_like(c0[r]),
                 cov=cond_sigmas[r]
             )
-
-        sigma_kk = np.diagonal(cond_sigmas, axis1=1, axis2=2) 
-        sigma_kk = sigma_kk[:, censoring_inds]
+ 
+        sigma_kk = cond_sigmas[:, censoring_ind, censoring_ind]
         # Fka = (np.exp(-(c0[:, censoring_inds] / sigma_kk) ** 2 / 2) / (np.sqrt(2 * np.pi) * sigma_kk)).flatten()
-        Fka = (np.exp(-(c0[:, censoring_inds]) ** 2 / (2 * sigma_kk)) / (np.sqrt(2 * np.pi) * sigma_kk)).flatten()
-        cond_sigma_row = cond_sigmas[:, censoring_inds, :].squeeze()
+        Fka = (np.exp(-(c0[:, censoring_ind]) ** 2 / (2 * sigma_kk)) / (np.sqrt(2 * np.pi) * sigma_kk))
         
+        cond_sigma_row = cond_sigmas[:, censoring_ind, :].squeeze()
+        if not cond_sigma_row.ndim:
+            cond_sigma_row = cond_sigma_row.reshape(1, -1)
+
         if np.isclose(cond_cdf, 0).any():
             if np.isclose(cond_cdf, 0).all():
-                print(x)
-                print(self.mus)
-                print(self.sigmas)
-                raise ValueError("All cdfs are 0")
+                raise HMTError("All cdfs are 0 when imputing values")
             with warnings.catch_warnings(): # Don't report divide by 0 error. 
                 # We ignore this as the contribution to the sum is 0 since the cdf is 0 so xi is 0
                 warnings.filterwarnings('ignore')
@@ -542,30 +588,25 @@ class MVN(Emission):
                 Ex0[zero_inds] = 0
         else:
             Ex0 = (cond_sigma_row.T * Fka / cond_cdf).T
-        if Ex0.ndim == 1:
+        if Ex0.ndim == 1 and self.n_hidden > 1:
             Ex0 = Ex0.reshape(-1, 1)
             cond_sigma_row = cond_sigma_row.reshape(-1, 1)
-
         Ex[:, np.isnan(x)] += Ex0
 
-        Ex0x0T = rowwise_outer(cond_sigma_row, cond_sigma_row)
+        Ex0x0T = rowwise_outer(cond_sigma_row, cond_sigma_row) / sigma_kk[:, None, None]
         if np.isclose(cond_cdf, 0).any():
             with warnings.catch_warnings(): # Don't report divide by 0 error. 
                 # We ignore this as the contribution to the sum is 0 since the cdf is 0 so xi is 0
                 warnings.filterwarnings('ignore')
-                Ex0x0T = (Ex0x0T.T * c[~np.isnan(c)][0] * Fka / (sigma_kk.flatten() * cond_cdf)).T
+                Ex0x0T = (Ex0x0T.T * (c0[:, censoring_ind] * Fka / cond_cdf)).T
                 Ex0x0T[zero_inds] = 0
         else:
-            # TODO double check this works!
-            Ex0x0T = (Ex0x0T.T * c[~np.isnan(c)][0] * Fka / (sigma_kk.flatten() * cond_cdf)).T
-            Ex0x0T += cond_sigmas
-        
-    
+            Ex0x0T *= (c0[:, censoring_ind] * Fka / cond_cdf)[:, None, None]
+        Ex0x0T += cond_sigmas
         R = Ex0x0T - rowwise_outer(Ex0, Ex0)
         Es = rowwise_outer(Ex - self.mus, Ex - self.mus)
         Es[np.ix_(np.arange(self.n_hidden), nulls, nulls)] += R
-        
-        return (Ex.T * xi).T, (Es.T * xi).T
+        return Ex * xi[:, None], Es * xi[:, None, None]
     
     def calc_mk_Hk(self, t):
         if t is None or np.isnan(t).all():
@@ -588,7 +629,9 @@ class MVN(Emission):
             scale=np.sqrt(self.sigmas[:, trunc_ind, trunc_ind])
         )
         mk = (self.sigmas[:, trunc_ind].squeeze().T * div0(pdf, survival)).T
-        assert mk.shape == (self.n_hidden, self.n_obs), f"mk: {mk.shape}"
+        if self.n_obs == 1:
+            mk = mk[..., None]
+        assert mk.shape == (self.n_hidden, self.n_obs), f"mk: {mk.shape} != {self.n_hidden, self.n_obs}, {self.death_ind}"
 
         Hk = rowwise_outer(mk, self.sigmas[:, trunc_ind])
         Hk = (Hk.T * (self.mus[:, trunc_ind] - trunc_val) / self.sigmas[:, trunc_ind, trunc_ind]).T
@@ -596,15 +639,15 @@ class MVN(Emission):
         assert Hk.shape == (self.n_hidden, self.n_obs, self.n_obs), f"Hk: {Hk.shape}"
         return mk, Hk
     
-    def truncation_correction(self, hmmodel):
+    def truncation_correction(self):
         mk_sum = np.zeros((self.n_hidden, self.n_obs))
         Hk_sum = np.zeros((self.n_hidden, self.n_obs, self.n_obs))
         
-        if hasattr(hmmodel, 'prev_env'):
+        if hasattr(self.hmmodel, 'prev_env'):
             # Assumes all truncated nodes are at the beggining of environment
-            trunc_nodes = hmmodel.trans_roots
+            trunc_nodes = self.hmmodel.trans_roots
         else:
-            trunc_nodes = hmmodel.where('t', lambda t: t is not None)
+            trunc_nodes = self.hmmodel.where('t', lambda t: t is not None)
 
         if self.death_ind is not None:
             trunc_nodes = [node for node in trunc_nodes if node.d == self.death_ind]
@@ -616,78 +659,47 @@ class MVN(Emission):
         return mk_sum, Hk_sum
         
 
-    def update_params(self, hmmodel):
-        """
-        Args
-        ----
-        hmmodel: HMTree / HMForest / VBHMTree / VBHMForest
-            The HMT model that is being trained
-        """
-        if hmmodel.has_null and not self.missing_pattern: # Comupute matrices if they're missing
+    def update_params(self):
+        if self.hmmodel.has_null and not self.missing_pattern: # Comupute matrices if they're missing
             # Calculate and store inverse matrices needed for conditional normal
             self.precalculate_matrices()
 
-        
-        # print(hmmodel.idx, xi_sum)
-        # print(xi_sum)
-
         if self.death_ind is None:
-            xi_sum = hmmodel.sum('xi')
-            mus_sum, sigmas_sum = hmmodel.multiple_sum(('xi', 'x', 'c', 't', 'd'), func=self.impute)
+            xi_sum = self.hmmodel.sum('xi')
+            mus_sum, sigmas_sum = self.hmmodel.multiple_sum(('xi', 'x', 'c', 't', 'd'), func=self.impute)
         else:
-            xi_sum = hmmodel.sum_where('xi', 'd', lambda d: d == self.death_ind)
-            mus_sum, sigmas_sum = hmmodel.multiple_sum_where(
+            xi_sum = self.hmmodel.sum_where('xi', 'd', lambda d: d == self.death_ind)
+            mus_sum, sigmas_sum = self.hmmodel.multiple_sum_where(
                 attrs=('xi', 'x', 'c', 't', 'd'),
                 func=self.impute,
                 cond_attr='d',
                 cond=lambda d: d == self.death_ind
                 )
-            # print(sigmas_sum.squeeze())
-            # print(xi_sum)
-            # if self.death_ind:
-            #     death_nodes = [node for node in hmmodel.leaves if node.d == self.death_ind]
-            #     mus_sum_test = np.zeros_like(self.mus)
-            #     for node in death_nodes:
-            #         mus_sum_test += self.impute(node.xi, node.x, node.c, node.t, node.d)[0]
-            #     assert np.allclose(mus_sum, mus_sum_test)
-
-        if hasattr(hmmodel, "prev_env") and hmmodel.prev_env is not None:
-            mk_sum, Hk_sum = self.truncation_correction(hmmodel)
-            mus_sum += mk_sum
-            sigmas_sum -= Hk_sum
-        # if not np.allclose(mk_sum, 0):
-        #     print(mk_sum[~np.isclose(mk_sum, 0)])
+        if np.any(sigmas_sum.diagonal(axis1=1, axis2=2) < 0):
+            raise HMTError("Negative values in sigma sum")
         
-        # print(self.mus)
-        # print(self.sigmas)
-        # print(xi_sum)
-        # print("\n")
 
-        # print(self.mus)
-        # print(self.sigmas, "\n")
+        if hasattr(self.hmmodel, "prev_env") and self.hmmodel.prev_env is not None:
+            mk_sum, Hk_sum = self.truncation_correction()
+            if np.any(Hk_sum.diagonal(axis1=1, axis2=2) + sigmas_sum.diagonal(axis1=1, axis2=2) < 0):
+                raise HMTError("Negative values after adding Hk_sum")
+            mus_sum -= mk_sum
+            sigmas_sum += Hk_sum
         
         self.mus, self.sigmas = (mus_sum.T / xi_sum).T, (sigmas_sum.T / xi_sum).T
-        # self.sigmas_test = self.sigmas.copy()
-        
-        # print("Param Update")
-        # print(self.sigmas, "\n")
 
         if not np.allclose(self.sigmas, np.transpose(self.sigmas, axes=(0, 2, 1))):
             raise HMTError("Sigma should be symmetric")
 
         eigs = np.linalg.eigvals(self.sigmas) if self.n_obs > 1 else self.sigmas
-        # print("Sigmas updated", eigs)
+        
         if (eigs < 0).any() or np.isclose(eigs, 0).any():
-            print(hmmodel.it)
-            print(eigs)
-            print(sigmas_sum)
-            print(self.sigmas)
-            raise HMTError("Sigma should be positive definite")
+            self.reinit_params(eigs)
         
         self.detsigma = np.linalg.det(self.sigmas)
         self.sigmainv = np.linalg.inv(self.sigmas)
 
-        if hmmodel.has_null: # Compute matrices for use with next E step (prob + imputing) 
+        if self.hmmodel.has_null: # Compute matrices for use with next E step (prob + imputing) 
             # Calculate and store inverse matrices needed for conditional normal
             self.precalculate_matrices()
 
@@ -697,6 +709,13 @@ class MVN(Emission):
         return np.random.normal(self.mus[hidden_state], np.sqrt(self.sigmas[hidden_state]))
 
     def sample_truncated(self, t, hidden_state):
+        if self.n_obs == 1:
+            t_sds = (t - self.mus[hidden_state]) / np.sqrt(self.sigmas[hidden_state])
+            return truncnorm.rvs(
+                a=t_sds, b=np.inf,
+                loc=self.mus[hidden_state],
+                scale=np.sqrt(self.sigmas[hidden_state])
+            )
         return TruncatedMVN(
             mu=self.mus[hidden_state],
             cov=self.sigmas[hidden_state],
@@ -706,13 +725,19 @@ class MVN(Emission):
 
 
 class VBMVN(MVN):
-    def __init__(self, n_hidden, n_obs, mus=None, sigmas=None):
-        super().__init__(n_hidden, n_obs, mus, sigmas)
+    def __init__(self, n_hidden, n_obs, hmmodel=None, mus=None, sigmas=None, death_ind=None):
+        super().__init__(
+            n_hidden=n_hidden, n_obs=n_obs, hmmodel=hmmodel, mus=mus, sigmas=sigmas,
+            death_ind=death_ind
+            )
         self.type = "VB"
         self.prior_ms = None
         self.prior_betas = None
         self.prior_nus = None
         self.prior_W_invs = None
+        self.logdet_priorW = None
+        self.prior_sigmainv = None
+        self.loggamma_prior_nu = None
 
         self.ms = None
         self.betas = None
@@ -724,16 +749,34 @@ class VBMVN(MVN):
     def __str__(self):
         return "MVN (VB)"
     
-
-    def set_priors(self, ms=None, betas=None, nus=None):
-        self.prior_ms = ms
-        self.prior_betas = betas
-        self.prior_nus = nus
-        self.prior_W_invs = None
+    def set_degenerate_state(self, degenerate_states):
+        super().set_degenerate_state(degenerate_states)
+        for attr in [
+            'prior_ms', 'prior_betas', 'prior_nus', 'prior_W_invs',
+            'ms', 'betas', 'nus', 'W_invs'
+        ]:
+            attr_val = getattr(self, attr)
+            if attr_val is not None:
+                setattr(self, attr, attr_val[self.generate_states, ...])
+        self.check_params()
     
 
-    def kmeans_start(self, hmmodel, seed=0):
-        X = hmmodel.to_numpy()[:, 2 : 2 + self.n_obs]
+    def set_priors(self, ms=None, betas=None, nus=None, W_invs=None):
+        if ms is not None:
+            self.prior_ms = ms
+        if betas is not None:
+            self.prior_betas = betas
+        if nus is not None:
+            self.prior_nus = nus
+            self.loggamma_prior_nu = loggamma(self.prior_nus / 2)
+        if W_invs is not None:
+            self.prior_W_invs = W_invs
+            self.logdet_priorW = -np.log(np.linalg.det(W_invs))
+            self.prior_sigmainv = (self.prior_W_invs.T * self.prior_betas).T
+    
+
+    def kmeans_start(self, seed=0):
+        X = self.hmmodel.to_numpy(include_ids=False)[:, :self.n_obs]
 
         # Impute any null values
         imp_mean = SimpleImputer(missing_values=np.nan, strategy='mean').fit(X)
@@ -741,7 +784,8 @@ class VBMVN(MVN):
 
         # Run k-means
         kmeans = KMeans(n_clusters=self.n_hidden, random_state=seed).fit(X)
-        self.ms = kmeans.cluster_centers_
+        if self.ms is None:
+            self.ms = kmeans.cluster_centers_
     
 
     def random_start(self, seed, init_ms=None, init_var=1):
@@ -768,37 +812,93 @@ class VBMVN(MVN):
         # Multivariate normal covariance degrees of freedom
         if self.prior_nus is None:
             self.prior_nus = np.full(self.n_hidden, fill_value=self.n_obs)
+            self.loggamma_prior_nu = loggamma(self.prior_nus / 2)
         if self.nus is None:
             self.nus = np.abs(np.random.randn(self.n_hidden))
         
         if self.prior_W_invs is None:
             self.prior_W_invs = np.stack([np.eye(self.n_obs) for _ in range(self.n_hidden)]) * self.n_obs
+            self.logdet_priorW = -np.log(np.linalg.det(self.prior_W_invs))
+            self.prior_sigmainv = (self.prior_W_invs.T * self.prior_betas).T
+            
         
         if self.W_invs is None:
             self.W_invs = np.stack([np.eye(self.n_obs) for _ in range(self.n_hidden)]) * init_var
         # print(self.W_invs)
         # print(self.nus)
 
-
-    def init_hyperparams(self, hmmodel=None, init_method='kmeans', seed=0, **init_kwargs):
+    def init_hyperparams(self, init_method='kmeans', seed=0, **init_kwargs):
         if init_method == 'kmeans':
             self.random_start(seed, **init_kwargs)
             # Overwrite mus with kmeans
-            self.kmeans_start(hmmodel, seed)
+            self.kmeans_start(seed)
         elif init_method == 'random':
             self.random_start(seed, **init_kwargs)
         else:
             raise HMTError("Invalid initialisation method")
         
-        if hmmodel.has_null:
+        if self.hmmodel.has_null:
             self.update_params()
             self.precalculate_matrices()
+    
+    def clear_hyperparams(self):
+        self.ms = None
+        self.betas = None
+        self.null_nus = None
+        self.nus = None
+        self.Winvs = None
+
+
+    def logpdf(self, x):
+        pass
+    
+    def pdf(self, x):
+        return np.exp(self.logpdf(x))
+    
+    # def pdf(self, x):
+    #     """
+    #     Predictive posterior is multivariate t distribution
+    #     """
+    #     if np.isnan(x).all():
+    #         raise HMTError("Cannot calculate probability of null vector")
+
+    #     if not np.isnan(x).any():
+    #         centered_x = x - self.ms
+    #         exponent = np.diag(np.diagonal(centered_x @ (self.W_invs.T * self.betas).T @ centered_x.T))
+    #         res = np.exp(-exponent / 2) / np.sqrt(detsigma * (2 * np.pi) ** n_obs)
+    #         # true_p = np.array([
+    #         #     multivariate_normal.pdf(x, mean=self.mus[0], cov=self.sigmas[0]),
+    #         #     multivariate_normal.pdf(x, mean=self.mus[1], cov=self.sigmas[1])
+    #         # ])
+    #         # assert np.allclose(res, true_p)
+    #         return res
+    
+    #     # If only a subset of x is null then we marginalise the probability
+    #     non_null_indices = (~np.isnan(x)).nonzero()[0]
+    #     marg_x = x[non_null_indices]
+    #     marg_mus = mus[:, non_null_indices]
+    #     marg_sigmas = sigmas[:, non_null_indices][:, :, non_null_indices]
+    #     try:
+    #         marg_sigmainv = np.linalg.inv(marg_sigmas)
+    #     except:
+    #         raise HMTError("x contains null values and marginalised sigma matrix is singular.")
+    #     marg_detsigma = np.linalg.det(marg_sigmas)
+
+    #     centered_x = marg_x - marg_mus
+    #     exponent = np.diag(np.diagonal(centered_x @ marg_sigmainv @ centered_x.T))
+    #     return np.exp(-exponent / 2) / np.sqrt(marg_detsigma * (2 * np.pi) ** non_null_indices.shape[0])
 
     def update_params(self):
-        """Overwrite ML update_params to have VB updates"""
+        """
+        Overwrite ML update_params to have VB updates
+
+        Not needed, provides MAP estimates that are not used.
+        """
+        return
         self.mus = self.ms
         self.sigmas = (self.W_invs.T / self.nus).T 
-        # print(f"{self.sigmas.shape = }")
+
+        # # print(f"{self.sigmas.shape = }")
 
         self.sigmainv = np.linalg.inv(self.sigmas)
         self.detsigma = 1 / np.linalg.det(self.sigmainv)
@@ -844,39 +944,44 @@ class VBMVN(MVN):
         return (Es.T * xi).T
     
 
-    def update_hyperparams(self, vb_hmmodel):
-        if vb_hmmodel.has_null:
+    def update_hyperparams(self):
+        if self.hmmodel.has_null:
             self.precalculate_matrices()
-        
+
         if self.death_ind is None:
             # Auxilliary values for caluclating updates for mu and sigma hyperparams
             # Note any null value will add 0 to the total
-            xi_sum = vb_hmmodel.sum(attrs='xi')
+            xi_sum = self.hmmodel.sum(attrs='xi')
 
             # Nixbar = vb_hmmodel.sum(attrs=('xi', 'x'), func=np.outer)
-            Nixbar = vb_hmmodel.sum(attrs=('xi', 'x'), func=self.mu_sum)
+            Nixbar = self.hmmodel.sum(attrs=('xi', 'x'), func=self.mu_sum)
 
             xbar = (Nixbar.T / xi_sum).T
             
-            NiSi = vb_hmmodel.sum(attrs=('xi', 'x'), func=lambda xi, x: self.cov_sum(xi, x, xbar))
+            NiSi = self.hmmodel.sum(attrs=('xi', 'x'), func=lambda xi, x: self.cov_sum(xi, x, xbar))
         else:
-            xi_sum = vb_hmmodel.sum_where('xi', 'd', lambda d: d == self.death_ind)
+            xi_sum = self.hmmodel.sum_where('xi', 'd', lambda d: d == self.death_ind)
+            xi_sum = xi_sum[self.generate_states]
             if np.any(xi_sum == 0):
-                print(f"{xi_sum = }")
-                raise HMTError("Degenerate hidden state")
-            Nixbar = vb_hmmodel.sum_where(
+                self.degenerate_state_prompt(np.where(np.isclose(xi_sum, 0))[0])
+                self.hmmodel.Estep()
+                return self.update_hyperparams()
+                
+            Nixbar = self.hmmodel.sum_where(
                 attrs=('xi', 'x', 'd'),
                 cond_attr='d',
                 cond=lambda d: d == self.death_ind,
                 func=self.mu_sum
                 )
+            Nixbar = Nixbar[self.generate_states]
             xbar = (Nixbar.T / xi_sum).T
-            NiSi = vb_hmmodel.sum_where(
+            NiSi = self.hmmodel.sum_where(
                 attrs=('xi', 'x', 'd'),
                 cond_attr='d',
                 cond=lambda d: d == self.death_ind,
                 func=lambda xi, x, d: self.cov_sum(xi, x, xbar, d)
                 )
+            NiSi = NiSi[self.generate_states]
 
         self.nus = self.prior_nus + xi_sum
         self.betas = self.prior_betas + xi_sum
@@ -904,24 +1009,33 @@ class VBMVN(MVN):
         self.nus = None
         self.null_nus = None
         self.W_invs = None
+    
+    def clear_priors(self):
+        self.prior_ms = None
+        self.prior_betas = None
+        self.prior_nus = None
+        self.loggamma_prior_nu = None
+        self.prior_W_invs = None
+        self.prior_sigmainv = None
+        self.logdet_priorW = None
 
     def get_hyperparams(self):
         return {
-            'ms': self.ms,
-            'betas': self.betas,
-            'nus': self.nus,
-            'W_invs': self.W_invs
+            'ms': self.ms.copy() if self.ms is not None else None,
+            'betas': self.betas.copy() if self.betas is not None else None,
+            'nus': self.nus.copy() if self.nus is not None else None,
+            'W_invs': self.W_invs.copy() if self.W_invs is not None else None
         }
 
     def set_hyperparams(self, ms=None, betas=None, nus=None, W_invs=None, check_params=True):
         if ms is not None:
-            self.ms = ms
+            self.ms = ms.copy()
         if betas is not None:
-            self.betas = betas
+            self.betas = betas.copy()
         if nus is not None:
-            self.nus = nus
+            self.nus = nus.copy()
         if W_invs is not None:
-            self.W_invs = W_invs
+            self.W_invs = W_invs.copy()
         if check_params:
             self.check_hyperparams()
     
@@ -961,9 +1075,48 @@ class VBMVN(MVN):
         # W_invs
         n_params += self.n_hidden * self.n_obs * (self.n_obs + 1) // 2
         return n_params
+    
+    def prior_KL_div(self):
+        Winv_KL = self.prior_nus * (self.logdet_priorW + np.log(np.linalg.det(self.W_invs))) # + since using det(W) = 1 / det(W_inv) and log of that is minus
+        trace = ...
+        for i in range(self.n_hidden):
+            Winv_KL[i] += self.nus[i] * np.trace(self.W_invs[i] @ np.linalg.inv(self.prior_W_invs[i]))
+        Winv_KL += 2 * (self.loggamma_prior_nu - loggamma(self.nus / 2))
+        Winv_KL += (self.nus - self.prior_nus) * digamma(self.nus / 2) - self.prior_nus * self.n_obs
+        Winv_KL /= 2
+
+        if self.prior_betas.any():
+            m_KL = (self.prior_ms - self.ms).T @ self.prior_sigmainv @ (self.prior_ms - self.ms)
+            m_KL += np.trace(self.prior_sigmainv @ self.sigmas)
+            logdet_prior_sigma = self.logdet_priorW - np.log(self.prior_betas)
+            m_KL += logdet_prior_sigma + np.log(self.sigma_inv_det)
+        else:
+            m_KL = - self.n_obs / 2
+        return  Winv_KL + m_KL
 
     def check_hyperparams(self):
         ... # TODO
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
@@ -1021,8 +1174,8 @@ class MVGamma(Emission):
 
     def get_params(self):
         return {
-            'alphas': self.alphas,
-            'betas': self.betas
+            'alphas': self.alphas.copy() if self.alphas is not None else None,
+            'betas': self.betas.copy() if self.betas is not None else None
         }
 
 

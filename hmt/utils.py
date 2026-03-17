@@ -3,6 +3,7 @@ Exension of numpy to do useful things
 """
 import numpy as np
 from hmt.exceptions import HMTError
+from scipy.special import loggamma
 
 
 def insort(a, x):
@@ -42,6 +43,8 @@ def rowwise_outer(a, b):
     for i in range(a.shape[0])
         c[i] = np.outer(a[i], b[i])
     """
+    if a.ndim == 1 and b.ndim == 1:
+        return np.outer(a, b)[None, ...]
     return np.einsum('ij, ik -> ijk', a, b)
 
 
@@ -150,6 +153,13 @@ def digamma(x):
         + f * (691 / 32760.0 + f * (-1 / 12.0 + f * 3617 / 8160.0)))))))
     return r + np.log(x_) - 0.5 / x_ + t
 
+def multivariate_digamma(x, d):
+    if isinstance(x, np.ndarray):
+        arr = x[:, None].repeat(d, axis=1)
+    else:
+        arr = np.full(d, x)
+    return digamma((arr + 1 - np.arange(1, d + 1)) / 2).cumsum(axis=1)
+
 
 def dirichlet_variance(weights):
     """
@@ -191,8 +201,28 @@ def log_subtraction(x, y):
     return np.log(np.exp(x) - np.exp(y))
 
 def is_iterable(obj):
+    if isinstance(obj, str):
+        return False
     try:
         iter(obj)
     except: 
         return False
     return True
+
+
+def dirichlet_KL(alphas, prior_alphas):
+    if alphas.ndim > 2:
+        alphas = alphas.reshape(alphas.shape[0], -1)
+        prior_alphas = prior_alphas.reshape(prior_alphas.shape[0], -1)
+    sum_axis = None if alphas.ndim == 1 else 1
+
+    alpha0, prior_alpha0 = alphas.sum(axis=sum_axis), prior_alphas.sum(axis=sum_axis)
+    p_KL = loggamma(alpha0) - loggamma(prior_alpha0)
+    p_KL += loggamma(prior_alphas).sum(axis=sum_axis)
+    p_KL -= loggamma(alphas).sum(axis=sum_axis)
+    digam = (digamma(alphas).T - digamma(prior_alpha0)).T
+    if alphas.ndim == 1:
+        return (alphas - prior_alphas) @ digam
+    for i in range(alphas.shape[0]):
+        p_KL[i] += (alphas[i] - prior_alphas[i]) @ digam[i]
+    return p_KL

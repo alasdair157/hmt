@@ -7,7 +7,7 @@ from collections import defaultdict
 import warnings
 
 from hmt.hidden_markov_tree import HMNode, HMForest
-from hmt.vb_hmt import VBHMModel
+from hmt.vb_hmt import VBHMForest
 from hmt.exceptions import HMTError
 from hmt.utils import div0, rowwise_outer, normal_round, digamma, log_addition, log_subtraction
 import hmt.emissions as emissions
@@ -26,16 +26,46 @@ def add_passthrough_methods(method_names):
         return cls
     return decorator
 
-def censor(node, L):
-    # print(L, node.x)
-    node.c = np.full_like(node.x, np.nan)
+
+def censor1d(node, L):
+    node.c = np.nan
     if L <= 0:
+        node.x = np.nan
+        if node.d0 is not None:
+            censor1d(node.d0, L)
+        if node.d1 is not None:
+            censor1d(node.d1, L)
+        return
+    
+    time = np.exp(node.x)
+    if L < time:
+        node.c = np.log(L)
+        node.x = np.nan
+        L = 0
+    L -= time
+
+    if node.d0 is not None:
+        censor1d(node.d0, L)
+    if node.d1 is not None:
+        censor1d(node.d1, L)
+
+def censor(node, L):
+    if node.hmmodel.n_obs == 1:
+        return censor1d(node, L)
+    # print(L, node.x)
+    if node.c is None:
+        node.c = np.full_like(node.x, np.nan)
+    if L <= 0:
+        # L <= 0 <=> past censoring point, so set everything to nan
+        node.c = np.full_like(node.x, np.nan)
         node.x = node.c.copy()
         if node.d0 is not None:
             censor(node.d0, L)
         if node.d1 is not None:
             censor(node.d1, L)
         return
+    
+    # if L > np.exp(node.x)
 
     for i, time in enumerate(np.exp(node.x)):
         if L < time:
@@ -97,20 +127,21 @@ class MultiEnvHMModel(HMForest):
             if self.next_env is not None:
                 self.next_env._prev_env = None
                 for leaf, root in zip(self.trans_leaves, self.next_env.trans_roots):
-                    leaf.next_env = None
-                    root.prev_env = None
+                    leaf.next = None
+                    root.prev = None
             self._next_env = None
             for leaf in self.trans_leaves:
-                leaf.next_env = None
+                leaf.next = None
             self.trans_leaves = []
             self.life_P = None
             return
         self._next_env = env
         env._prev_env = self
-        for leaf, root in zip(self.trans_leaves, env.trans_roots):
-            assert leaf.id == root.id
-            leaf.next_env = root
-            root.prev_env = leaf
+        if env.trans_roots:
+            for leaf, root in zip(self.trans_leaves, env.trans_roots):
+                assert leaf.id == root.id
+                leaf.next = root
+                root.prev = leaf
     
     @property
     def prev_env(self):
@@ -122,19 +153,19 @@ class MultiEnvHMModel(HMForest):
             if self.prev_env is not None:
                 self.prev_env._next_env = None
                 for leaf, root in zip(self.prev_env.trans_leaves, self.trans_roots):
-                    leaf.next_env = None
-                    root.prev_env = None
+                    leaf.next = None
+                    root.prev = None
             self._prev_env = None
             for root in self.trans_roots:
-                root.prev_env = None
+                root.prev = None
             self.trans_roots = []
             return
         self._prev_env = env
         env._next_env = self
         for leaf, root in zip(env.trans_leaves, self.trans_roots):
             assert leaf.id == root.id
-            leaf.next_env = root
-            root.prev_env = leaf
+            leaf.next = root
+            root.prev = leaf
 
     def __repr__(self):
         return f"MultiEnvHMModel({self.idx})"
@@ -142,25 +173,27 @@ class MultiEnvHMModel(HMForest):
     def __str__(self):
         return f"MultiEnvHMModel({self.idx})"
 
-    def set_params(self, init_s_distr=None, P=None, sister_dep=None, daughter_order=None, check_params=True, **emission_params):
-        """
-        Args
-        ----
-        emission_params: list
-            list of dictionaries in the format {kwarg_name: kwarg}
-        """
-        if self.prev_env is not None and init_s_distr is not None:
-            raise NotImplementedError("Currently root cells are only supported in the first environment")
-        super().set_params(
-            init_s_distr=init_s_distr, P=P, sister_dep=sister_dep,
-            daughter_order=daughter_order, check_params=check_params, **emission_params
-            )   
-
     def get_params(self):
-        params = [super().get_params()]
+        return {
+            **super().get_params(),
+            'life_P': self.life_P.copy() if self.life_P is not None else None,
+            'next_env_params': None if self.next_env is None else self.next_env.get_params()
+        }
+
+    def set_params(
+            self,
+            init_s_distr=None,
+            P=None,
+            life_P=None,
+            next_env_params=None,
+            **emission_distr_params
+            ):
+        super().set_params(init_s_distr=init_s_distr, P=P, **emission_distr_params)
         if self.next_env is not None:
-            params += self.next_env.get_params()
-        return params
+            if life_P is not None:
+                self.life_P = life_P.copy()
+            if next_env_params is not None:
+                self.next_env.set_params(**next_env_params)
 
     # def emission(self, node):
     #     """
@@ -214,6 +247,7 @@ class MultiEnvHMModel(HMForest):
         self.calculate_s_distr()
         self.upward_pass()
         self.downward_pass()
+        return self.loglikelihood
     
     def update_init_s_distr(self):
         if self.prev_env is not None:
@@ -221,7 +255,7 @@ class MultiEnvHMModel(HMForest):
         super().update_init_s_distr()
     
     def update_emission_params(self):
-        self.emission_distr.update_params(self)
+        self.emission_distr.update_params()
         if self.next_env is not None:
             self.next_env.update_emission_params()
     
@@ -246,21 +280,31 @@ class MultiEnvHMModel(HMForest):
             censor(root, cutoff_time) # Cut off times
             root.remove_where(lambda node: np.isnan(node.x).all() and np.isnan(node.c).all()) # Remove nodes after cutoff times
         self.get_leaves() # Find leaves after removing nodes
+        self.trans_leaves = [leaf for leaf in self.leaves if not np.isnan(leaf.c).all()]
 
     def sample_next_s(self, root):
         pass
 
 
-    def sample(self, n_nodes, cutoff_time, init_trees=1, dropout=0.0, sample_all_envs=True, nodes_per_root=None):
+    def sample(
+        self,
+        n_nodes,
+        cutoff_time,
+        init_trees=1,
+        dropout=0.0,
+        sample_all_envs=True,
+        nodes_per_root=None,
+        has_death=False
+    ):
         """
         Args
         ----
         change_times: list, tuple, ndarray
             Iterable of change times starting with start of experiment, then the
-        TODO add random start times
+        TODO add random start times <- important!
         """
         if self.prev_env is None: # Sample normally
-            super().sample(n_trees=init_trees, n_nodes=n_nodes, dropout=dropout)
+            super().sample(n_trees=init_trees, n_nodes=n_nodes, dropout=dropout, has_death=has_death)
         else: # Sample with truncation
             if self.prev_env.trans_leaves is None:
                 raise HMTError("You must first sample from the previous environment")
@@ -276,22 +320,37 @@ class MultiEnvHMModel(HMForest):
                 root.t = np.where(~np.isnan(root.c), root.c, -np.inf)
                 root.c = np.full_like(root.c, np.nan)
                 
-                env2_x = self.emission_distr.sample_truncated(t=root.t, hidden_state=root.s)
+                if has_death:
+                    d, env2_x = self.emission_distr.sample_truncated(t=root.t, hidden_state=root.s)
+                else:
+                    env2_x = self.emission_distr.sample_truncated(t=root.t, hidden_state=root.s)
+                if self.n_obs == 1:
+                    env2_x = env2_x.item()
+                    root.c = root.c.item()
                 env2_x = log_subtraction(env2_x, root.t)
-                env2_x[~np.isnan(root.x)] = np.nan
+                if self.n_obs > 1:
+                    env2_x[~np.isnan(root.x)] = np.nan
                 root.x = env2_x
                 root.hmmodel = self # Change node's hmmodel to be current environment
-                root.sample(nodes_per_root, p=dropout)
+                if has_death:
+                    root.d = d
+                    if d:
+                        self.leaves.append(root)
+                    else:
+                        root.sample(nodes_per_root, p=dropout, has_death=has_death)
+                else:
+                    root.sample(nodes_per_root, p=dropout, has_death=has_death)
+
             self.roots = self.trans_roots.copy() # Can add other roots here if need be
         
         if self.next_env is not None:
             self.cutoff(cutoff_time)
-            self.trans_leaves = [leaf for leaf in self.leaves if not np.isnan(leaf.c).all()]
             # self.trans_leaves = self.leaves
-
             if sample_all_envs:
                 self.next_env.sample(n_nodes, cutoff_time, dropout=dropout, sample_all_envs=sample_all_envs, nodes_per_root=nodes_per_root)
     
+    # TODO implement add_nodes_from_pandas
+
     @classmethod
     def from_pandas(cls, df, n_hidden, n_obs, obs_cols, n_envs, change_time, obs_func=None):
         cols = df.columns.tolist()
@@ -369,10 +428,6 @@ class MultiEnvSwitchHMModel(MultiEnvHMModel):
             self.init_life_P()
             self.next_env.init_params(init_method)
     
-    def set_params(self, life_P=None, *args, **kwargs):
-        self.life_P = life_P
-        super().set_params(*args, **kwargs)
-    
     def extract_ml_s(self):
         for root in self.roots:
             if self.sister_dep:
@@ -382,12 +437,11 @@ class MultiEnvSwitchHMModel(MultiEnvHMModel):
     
     def Mstep(self):
         # Update next_env P
-        self.update_life_P()
+        if self.next_env is not None:
+            self.update_life_P()
         super().Mstep()
 
     def update_life_P(self):
-        if self.next_env is None:
-            raise HMTError("Cannot update environment transition if environment is None")
         xi_ij = sum(leaf.xi_n for leaf in self.trans_leaves)
         xi_i = sum(leaf.xi for leaf in self.trans_leaves)
         self.life_P = (xi_ij.T / xi_i).T
@@ -424,19 +478,22 @@ class MultiEnvSwitchHMModel(MultiEnvHMModel):
         """
         Only called when node.next is not None
         """
-        if hasattr(self.next_env.emission_distr, "distrs"):
-            node.xi_n = self.life_P * node.next.beta_c_u * self.next_env.emission_distr.distrs[node.d].trunc_pdf(
-                x=log_addition(node.next.x, node.next.t), t=node.next.t
-            )
-        else:
-            node.xi_n = self.life_P * node.next.beta_c_u * self.next_env.emission_distr.trunc_pdf(
-                x=log_addition(node.next.x, node.next.t), t=node.next.t
-                )
+        # if hasattr(self.next_env.emission_distr, "distrs"):
+        trunc_pdf = self.next_env.emission_distr.emission(node.next)
+        node.xi_n = self.life_P * node.next.beta_c_u * trunc_pdf
+            # self.next_env.emission_distr.distrs[node.d].trunc_pdf(
+            #     x=log_addition(node.next.x, node.next.t), t=node.next.t
+            # )
+        # else:
+        #     node.xi_n = self.life_P * node.next.beta_c_u * self.next_env.emission_distr.trunc_pdf(
+        #         x=log_addition(node.next.x, node.next.t), t=node.next.t
+        #         )
             
-        # Really it's beta_{n(u), u}, but in the code this works the same as
-        # beta_{c(u), u}, so we assign it to the same variable
+        # NOTE Really it's beta_{n(u), u}, but in the code this works the same as
+        # beta_{c(u), u}, so we assign it to the same variable for simplicity
         node.beta_c_u = node.xi_n.sum(axis=1)
-        node.xi_n = (node.xi_n.T / node.beta_c_u).T
+        # node.xi_n = (node.xi_n.T / node.beta_c_u).T
+        node.xi_n = div0(node.xi_n.T, node.beta_c_u).T
         assert node.beta_c_u.shape == (self.n_hidden, )
     
     def drec_next(self, node):
@@ -453,11 +510,165 @@ class MultiEnvSwitchHMModel(MultiEnvHMModel):
         assert np.isclose(node.next.xi.sum(), 1)
         assert np.allclose(node.xi_n.sum(axis=1), node.xi)
     
+    def sd_viterbi_next(self, node):
+        """
+        Only called when self.next is not None
+        """
+        node.delta = self.emission(node)
+        _delta = self.life_P * node.next.delta
+        # print(_delta)
+        assert _delta.shape == self.life_P.shape
+        node.optimal_next_state = np.argmax(_delta, axis=1)
+        assert node.optimal_next_state.shape == (self.n_hidden, )
+        node.delta = (_delta[node.optimal_next_state].T * node.delta).T
+        # print(np.log(node.delta))
+
+    def sd_viterbi_extract_ml_s_next(self, node):
+        ...
+
+
+    
     def extract_next_ml_s(self, node):
         node.next.ml_s = np.argmax(node.xi_n[node.ml_s])
 
     def sample_next_s(self, root):
         return np.random.choice(np.arange(self.n_hidden), p=self.prev_env.life_P[root.s])
+
+
+
+class VBMultiEnvHMModel(MultiEnvHMModel, VBHMForest):
+    def __init__(self, n_hidden, n_obs, next_env=None, prev_env=None, life_P=None, idx=None, *hmargs, **hmkwargs):
+        super().__init__(n_hidden, n_obs, next_env, prev_env, life_P, idx, *hmargs, **hmkwargs)
+
+
+@add_passthrough_methods(
+    ['clear_hyperparams']
+)
+class VBMultiEnvSwitchHMModel(VBMultiEnvHMModel, MultiEnvSwitchHMModel):
+    def __init__(self, n_hidden, n_obs, next_env=None, prev_env=None, life_P=None, idx=None, *hmargs, **hmkwargs):
+        super().__init__(n_hidden, n_obs, next_env, prev_env, life_P, idx, *hmargs, **hmkwargs)
+        self.prior_life_P_weights = None
+        self.life_P_weights = None
+    
+    def set_priors(self, life_P_weights=None, pi_weights=None, P_weights=None, emission_distr_priors=None):
+        if life_P_weights is not None:
+            assert self.next_env is not None
+        self.prior_life_P_weights = life_P_weights
+        super().set_priors(pi_weights, P_weights, emission_distr_priors)
+    
+    def clear_priors(self):
+        self.prior_life_P_weights = None
+        super().clear_priors()
+
+    
+    def clear_hyperparams(self):
+        self.life_P_weights = None
+        super().clear_hyperparams()
+        if self.next_env is not None:
+            self.next_env.clear_hyperparams()
+    
+    def get_hyperparams(self):
+        return {
+            **super().get_hyperparams(),
+            "life_P_weights": self.life_P_weights.copy() if self.life_P_weights is not None else None,
+            "next_env_hyperparams": None if self.next_env is None else self.next_env.get_hyperparams()
+        }
+
+    def get_params_and_hyperparams(self):
+        return {
+            **super().get_params_and_hyperparams(),
+            'next_env_params': None if self.next_env is None else self.next_env.get_params(),
+            'next_env_hyperparams': None if self.next_env is None else self.next_env.get_hyperparams()
+        }
+    
+    def set_params_and_hyperparams(
+            self,
+            life_P_weights=None,
+            life_P=None,
+            pi_weights=None,
+            init_s_distr=None,
+            P_weights=None,
+            P=None,
+            next_env_params=None,
+            next_env_hyperparams=None,
+            **emission_params_and_hyperparams
+    ):
+        self.set_params(
+            init_s_distr=init_s_distr, P=P, life_P=life_P, next_env_params=next_env_params
+        )
+        self.set_hyperparams(
+            life_P_weights=life_P_weights, pi_weights=pi_weights, P_weights=P_weights,
+            next_env_hyperparams=next_env_hyperparams
+            )
+       
+        self.emission_distr.set_params_and_hyperparams(**emission_params_and_hyperparams)
+
+    def set_hyperparams(
+            self,
+            life_P_weights=None,
+            pi_weights=None,
+            P_weights=None,
+            next_env_hyperparams=None,
+            **emission_hyperparams
+            ):
+        if life_P_weights is not None:
+            self.life_P_weights = life_P_weights.copy()
+        if next_env_hyperparams is not None and self.next_env is not None:
+            self.next_env.set_hyperparams(**next_env_hyperparams)
+        super().set_hyperparams(pi_weights, P_weights, **emission_hyperparams)
+
+    def init_hyperparams(self):
+        """
+        Emission_hyperparams is no longer kwarg, as can't set multiple environments hyperparams, do this manually
+        """
+        super().init_hyperparams()
+        if self.next_env is not None:
+            if self.prior_life_P_weights is None:
+                self.prior_life_P_weights = np.ones((self.n_hidden, self.next_env.n_hidden))
+            if self.life_P_weights is None:
+                self.life_P_weights = np.ones((self.n_hidden, self.next_env.n_hidden))
+            self.next_env.init_hyperparams()
+    
+    def update_life_P_weights(self):
+        self.life_P_weights = self.prior_life_P_weights + sum(leaf.xi_n for leaf in self.trans_leaves)
+    
+    def update_params(self):
+        super().update_params()
+        if self.next_env is not None:
+            self.life_P = np.exp(
+                    (digamma(self.life_P_weights).T - digamma(self.life_P_weights.sum(axis=1))).T
+                )
+            # Normalise life_P
+            self.life_P = (self.life_P.T / self.life_P.sum(axis=1)).T
+            assert np.allclose(self.life_P.sum(axis=1), 1)
+            self.next_env.update_params()
+        
+    def Mstep(self):
+        # Hyperparams
+        self.update_P_weights()
+        self.emission_distr.update_hyperparams()
+        if self.prev_env is None:
+            self.update_pi_weights()
+        if self.next_env is not None:
+            self.update_life_P_weights()
+
+        # Params
+        self.update_params()
+        
+        if self.next_env is not None:
+            self.next_env.Mstep()
+    
+    def number_of_params(self):
+        n_params = super().number_of_params()
+        if self.next_env is not None:
+            n_params += self.next_env.number_of_params()
+        return n_params
+    
+    def prior_KL_div(self):
+        q_KL = super().prior_KL_div()
+        if self.next_env is not None:
+            q_KL += self.next_env.prior_KL_div()
+        return q_KL
 
 '''
 class MultiEnvNoSwitchHMModel(MultiEnvHMModel):

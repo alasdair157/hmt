@@ -11,7 +11,7 @@ import warnings
 
 from hmt.core import Node, Tree, Forest
 from hmt.exceptions import HMTError
-from hmt.utils import div0, rowwise_outer, normal_round, digamma
+from hmt.utils import div0, rowwise_outer, normal_round, digamma, log_addition
 import hmt.emissions as emissions
 
 # logging.basicConfig(level=logging.ERROR, format="hmt %(levelname)s: %(message)s")
@@ -76,7 +76,7 @@ class HMNode(Node):
     [1]
     [2] Me :)
     """
-    def __init__(self, node_id, observed, hmmodel=None, c=None, d=None, t=None, hidden_state=None):
+    def __init__(self, node_id, observed, hmmodel=None, d=None, c=None, t=None, hidden_state=None):
         super().__init__(node_id, observed)
         self.hmmodel = hmmodel
         self.s, self.c, self.d, self.t = hidden_state, c, d, t
@@ -103,6 +103,34 @@ class HMNode(Node):
         self.prev = None
 
         self.Ex = np.empty((self.hmmodel.n_hidden, self.hmmodel.n_obs))
+
+    def __eq__(self, other):
+        for attr in ['id', 'd', 's', 'ml_s', 'next', 'prev']:
+            try:
+                if np.isnan(getattr(self, attr)):
+                    if not np.isnan(getattr(other, attr)):
+                        print(f"{attr} nan")
+                        return False
+                    continue
+            except TypeError:
+                continue
+            if getattr(self, attr) != getattr(other, attr):
+                print(f"{attr} not equal")
+                return False
+        for npattr in ['x', 'c', 't']:
+            if getattr(self, npattr) is None:
+                if getattr(other, npattr) is not None:
+                    print(f"{npattr} None")
+                    return False
+                continue
+            if np.all(np.isnan(getattr(self, npattr))):
+                if not np.all(np.isnan(getattr(other, npattr))):
+                    return False
+                continue
+            if not np.allclose(getattr(self, npattr), getattr(other, npattr)):
+                print(f"{npattr} not equal")
+                return False
+        return True
 
 
     def __repr__(self):
@@ -346,10 +374,16 @@ class HMNode(Node):
         N = np.sum(self.beta_c)
         if N == 0:
             print(self.id)
+            print(self.x)
+            print(self.hmmodel.idx)
             if self.d0 is not None:
                 print(f"d0 emission: {self.hmmodel.emission(self.d0)}")
+                print(self.d0.d, self.d0.x, self.d0.c, self.d0.t)
+                print(self.d0.beta_c_u)
             if self.d1 is not None:
                 print(f"d1 emission: {self.hmmodel.emission(self.d1)}")
+                print(self.d1.d, self.d1.x, self.d1.c, self.d1.t)
+                print(self.d1.beta_c_u)
             raise HMTError("sum of beta_c is 0")
         self.hmmodel.loglikelihood += np.log(N)
         self.beta_c = self.beta_c / N
@@ -434,8 +468,12 @@ class HMNode(Node):
             # Sum over i and j
             self.xi = np.sum(self.xi_f, axis=(1, 2))
         else:
-            self.xi_f = (self.hmmodel.P.T * div0(self.xi, self.beta_c_u)).T
-            self.xi_f *= div0(self.beta_c, self.sc_distr)
+            try:
+                self.xi_f = (self.hmmodel.P.T * div0(self.xi, self.beta_c_u)).T
+                self.xi_f *= div0(self.beta_c, self.sc_distr)
+            except:
+                print(self.xi, self.beta_c_u)
+                assert False
         # Quick check to see probabilities are the same
         # print(np.allclose(self.xi - np.sum(self.xi_f, axis=(1, 2))))
         self.xi_c = np.sum(self.xi_f, axis=0)
@@ -496,20 +534,27 @@ class HMNode(Node):
                 self.d1.sd_extract_ml_s(d_drec, n_drec)
 
 
-    def sd_viterbi(self, d_urec=True):
-        if self.next is not None:
-            return
+    def sd_viterbi(self, d_urec=True, n_urec=False):
+        if n_urec:
+            if self.next is not None:
+                self.next.sd_viterbi(d_urec, n_urec)
         if d_urec:
             # Recursion using post order tree traversal
             if self.d0 is not None:
                 # print(self.id, "Left")
-                self.d0.sd_viterbi(d_urec)
+                self.d0.sd_viterbi(d_urec, n_urec)
             if self.d1 is not None:
                 # print(self.id, "Right")
-                self.d1.sd_viterbi(d_urec)
+                self.d1.sd_viterbi(d_urec, n_urec)
+        
+        if self.next is not None:
+            self.hmmodel.sd_viterbi_next(self)
+            return
 
         # print(f"   **   {self.id}   **")
         self.delta = self.hmmodel.emission(self)
+
+        
         
         if self.d0 is None and self.d1 is None:
             return
@@ -544,7 +589,7 @@ class HMNode(Node):
         max_delta = np.zeros(self.hmmodel.n_hidden)
         for i in range(self.hmmodel.n_hidden):
             if self.d0 is not None and self.d1 is not None:
-                opt_d0_state, opt_d1_state = self.optimal_daughter_states[i][0], self.optimal_daughter_states[i][0]
+                opt_d0_state, opt_d1_state = self.optimal_daughter_states[i][0], self.optimal_daughter_states[i][1]
                 max_delta[i] = _delta[i, opt_d0_state, opt_d1_state]
                 continue
             if self.d0 is not None:
@@ -559,24 +604,30 @@ class HMNode(Node):
 #       /\
 #       |
 #      \/
-    def sd_viterbi_extract_ml_s(self, drec=False):
+    def sd_viterbi_extract_ml_s(self, d_drec=True, n_drec=False):
         """
         Extracts hidden state of daughter nodes (and current node if self is the root)
         based on Viterbi algorithm
         """
+        if self.delta is None:
+            raise HMTError("Delta probabilities not calculated, call hmmodel.sd_viterbi() first")
         if self.mother is None: # Root node
             self.ml_s = np.argmax(np.multiply(self.delta, self.s_distr))
+        
+        if self.next is not None and n_drec:
+            self.hmmodel.sd_viterbi_extract_ml_s_next(self)
+            return 
         if self.d0 is None and self.d1 is None: # Leaves
             return
 
         if self.d0 is not None:
             self.d0.ml_s = self.optimal_daughter_states[self.ml_s][0]
-            if drec: # Continue recursion
-                self.d0.sd_extract_ml_s(drec)
+            if d_drec: # Continue recursion
+                self.d0.sd_extract_ml_s(d_drec)
         if self.d1 is not None:
             self.d1.ml_s = self.optimal_daughter_states[self.ml_s][1]
-            if drec: # Continue recursion
-                self.d1.sd_extract_ml_s(drec)
+            if d_drec: # Continue recursion
+                self.d1.sd_extract_ml_s(d_drec)
 
 
     """=================== SISTER DEPENDENCE ENDS HERE ==================="""
@@ -651,9 +702,9 @@ class HMNode(Node):
         if N0 != 0:
             if has_death:
                 death_0, x0 = self.hmmodel.emission_distr.sample(s0) # Assumes death distribution has 2 outputs
-            elif truncated:
-                trunc_ind = np.random.choice(np.arange(self.hmmodel.n_obs))
-                t = np.random.normal(self.hmmodel.emission_distr.mus[s0])
+            # elif truncated:
+            #     trunc_ind = np.random.choice(np.arange(self.hmmodel.n_obs))
+            #     t = np.random.normal(self.hmmodel.emission_distr.mus[s0])
             else:
                 x0 = self.hmmodel.emission_distr.sample(s0)
             if self.hmmodel.n_obs == 1:
@@ -663,7 +714,7 @@ class HMNode(Node):
                 cell_id = '-'.join((tree, str(int(m_id) * 2)))
             else:
                 cell_id = self.id * 2
-            d0 = HMNode(cell_id, observed=x0, hmmodel=self.hmmodel, s=s0)
+            d0 = HMNode(cell_id, observed=x0, hmmodel=self.hmmodel, hidden_state=s0)
             d0.mother = self
             d0._path = self._path + '0'
             self.d0 = d0
@@ -688,7 +739,7 @@ class HMNode(Node):
                 cell_id = '-'.join((tree, str(int(m_id) * 2 + 1)))
             else:
                 cell_id = self.id * 2 + 1
-            d1 = HMNode(cell_id, observed=x1, hmmodel=self.hmmodel, s=s1)
+            d1 = HMNode(cell_id, observed=x1, hmmodel=self.hmmodel, hidden_state=s1)
             d1.mother = self
             d1._path = self._path + '1'
             self.d1 = d1
@@ -771,8 +822,13 @@ class HMNode(Node):
         # print(next_time)
         next_x, next_c = self.x.copy(), self.c.copy()
         next_x[:phase_ind], next_c[:phase_ind] = np.nan, np.nan
-        next_x[phase_ind] = next_time
-        next_t = np.full_like(self.x, np.nan)
+        if np.isnan(next_x[phase_ind]):
+            if np.isnan(next_c[phase_ind]):
+                raise HMTError("Both x and c are null so can't be truncated")
+            next_c[phase_ind] = next_time
+        else:
+            next_x[phase_ind] = next_time
+        next_t = np.full_like(self.x, -np.inf)
         next_t[phase_ind] = prev_time
         self.x[phase_ind:], self.c[phase_ind:] = np.nan, np.nan
         self.c[phase_ind] = prev_time
@@ -816,6 +872,8 @@ class HMNode(Node):
                 obs[censoring_inds] = np.nan
         else:
             c = None
+        if np.all(np.isnan(obs)) and np.all(np.isnan(c)):
+            print(row)
         return HMNode(
             node_id=row['Cell ID'],
             observed=obs,
@@ -848,7 +906,8 @@ class HMNode(Node):
             )
             self.add_daughter(d)
             next_time = curr_time + np.sum(np.where(~np.isnan(d.x), np.exp(d.x), 0))
-            next_time += np.sum(np.where(~np.isnan(d.c), np.exp(d.c), 0))
+            if "C" in df.columns:
+                next_time += np.sum(np.where(~np.isnan(d.c), np.exp(d.c), 0))
             if (
                 change_time is not None and
                 curr_time < change_time and
@@ -1037,10 +1096,10 @@ class HMModel:
 
     def get_params(self):
         return {
-            'init_s_distr': self.init_s_distr,
-            'P': self.P,
-            'sister_dep': self.sister_dep,
-            'daughter_order': self.daughter_order,
+            'init_s_distr': self.init_s_distr.copy() if self.init_s_distr is not None else None,
+            'P': self.P.copy() if self.P is not None else None,
+            # 'sister_dep': self.sister_dep,
+            # 'daughter_order': self.daughter_order,
             **self.emission_distr.get_params()
         }
 
@@ -1142,6 +1201,7 @@ class HMModel:
         if not np.allclose(np.sum(self.P, axis=(1, 2)), 1):
             print(f"Iteration {self.it}")
             print(np.sum(self.P, axis=(1, 2)))
+            print(xi_f_sum)
             print((f"{self.sum('xi') = }"))
             print((f"{self.leaf_sum('xi') = }"))
             print(self.P)
@@ -1158,7 +1218,7 @@ class HMModel:
         self.update_P()
         
         # Update emission distribution parameters
-        self.emission_distr.update_params(self)
+        self.emission_distr.update_params()
     
 
     def find_missing_pattern(self):
@@ -1172,14 +1232,15 @@ class HMModel:
     def death_missing_pattern(self):
         for death_ind, distr in enumerate(self.emission_distr.distrs):
             if death_ind == 0:
-                distr.missing_pattern = {idxs: defaultdict() for idxs in self.null_indices()}
-                continue
-            # Just search leaf nodes
-            death_nodes = [node for node in self.leaves if node.d == death_ind]
+                death_nodes = [node for node in self.where('d', lambda d: d == 0)]
+                end = None
+            else:
+                death_nodes = [node for node in self.leaves if node.d == death_ind]
+                end = death_ind
             null_idxs = {
                 tuple(
-                    np.argwhere(np.isnan(node.x[:death_ind])).flatten()
-                    ) for node in death_nodes if np.isnan(node.x[:death_ind]).any()
+                    np.argwhere(np.isnan(node.x[:end])).flatten()
+                    ) for node in death_nodes if np.isnan(node.x[:end]).any()
                 }
             distr.missing_pattern = {idxs: defaultdict() for idxs in null_idxs}
 
@@ -1265,7 +1326,10 @@ class HMModel:
         return best_it
     
     def has_death(self):
-        death_inds = np.unique([leaf.d for leaf in self.leaves])
+        death = [leaf.d for leaf in self.leaves if leaf.d is not None]
+        if not death:
+            return False
+        death_inds = np.unique(death)
         return len(death_inds) > 1
 
 
@@ -1360,7 +1424,7 @@ class HMTree(HMModel, Tree):
             obs = self.emission_distr.sample(s)
         if self.n_obs == 1:
             obs = float(obs)
-        self.root = HMNode(root_id, observed=obs, hmmodel=self, s=s)
+        self.root = HMNode(root_id, observed=obs, hmmodel=self, hidden_state=s)
         if has_death:
             self.root.d = death
             self.leaves.append(self.root)
@@ -1368,13 +1432,13 @@ class HMTree(HMModel, Tree):
                 return
         self.root.sample(N, p, has_death=has_death) # With death we will have fewer than N cells
 
-    def sample_with_death(self, N, p, root_id=1):
-        s = np.random.choice(np.arange(self.n_hidden), p=self.init_s_distr)
-        obs = self.emission_distr.sample(s)
-        if self.n_obs == 1:
-            obs = float(obs)
-        self.root = HMNode(root_id, observed=obs, hmmodel=self, s=s)
-        self.root.sample_with_death(N, p)
+    # def sample_with_death(self, N, p, root_id=1):
+    #     s = np.random.choice(np.arange(self.n_hidden), p=self.init_s_distr)
+    #     obs = self.emission_distr.sample(s)
+    #     if self.n_obs == 1:
+    #         obs = float(obs)
+    #     self.root = HMNode(root_id, observed=obs, hmmodel=self, s=s)
+    #     self.root.sample_with_death(N, p)
     
 
     """" ################# Input / Output ################# """
@@ -1619,7 +1683,7 @@ class HMForest(HMModel, Forest):
             root.clean()
     
 
-    def sample(self, n_trees, n_nodes, dropout, has_death=False):
+    def sample(self, n_trees, n_nodes, dropout, has_death=False, keep_sampling=False):
         self.roots = [] # Clear any current trees in the forest
         n_nodes_remaining = 0
         for i in range(n_trees):
@@ -1630,7 +1694,7 @@ class HMForest(HMModel, Forest):
                 obs = self.emission_distr.sample(s)
             if self.n_obs == 1:
                 obs = float(obs)
-            root = HMNode(f"t{i+1}-1", observed=obs, hmmodel=self, s=s)
+            root = HMNode(f"t{i+1}-1", observed=obs, hmmodel=self, hidden_state=s)
             if has_death:
                 root.d = death
                 if death:
@@ -1642,7 +1706,8 @@ class HMForest(HMModel, Forest):
             # print(n_nodes_to_add)
             n_nodes_remaining += n_nodes_to_add
             self.roots.append(root)
-
+        if not keep_sampling:
+            return
         # Sample remaining nodes that weren't added to original trees due to death
         while n_nodes_remaining > 0:
             # TODO doesn't work when we go in to this while loop a second time
@@ -1657,7 +1722,7 @@ class HMForest(HMModel, Forest):
                 obs = self.emission_distr.sample(s)
             if self.n_obs == 1:
                 obs = float(obs)
-            root = HMNode(f"t{i+1}-1", observed=obs, hmmodel=self, s=s)
+            root = HMNode(f"t{i+1}-1", observed=obs, hmmodel=self, hidden_state=s)
             if has_death:
                 root.d = death
                 if death:
@@ -1670,66 +1735,46 @@ class HMForest(HMModel, Forest):
 
     """ =================== Input / Output =================== """
 
-    def to_numpy(self, attrs=None):
-        has_true_s = self.roots[0].s is not None
+    # def to_numpy(self, attrs=None, attr_func=None):
+    #     has_true_s = self.roots[0].s is not None
         
-        # Make an empty array with n_nodes rows, and the columns
-        # [id, mother_id, x_0, x_1, ..., x_(n_obs), true_hidden_state (if known)]
-        n_nodes = sum([len(tree) for tree in self.roots])
-        n_attrs = len(attrs) if attrs is not None else 0
-        X = np.zeros((n_nodes, 2 + self.n_obs + has_true_s + n_attrs), dtype=object)
+    #     # Make an empty array with n_nodes rows, and the columns
+    #     # [id, mother_id, x_0, x_1, ..., x_(n_obs), true_hidden_state (if known)]
+    #     n_nodes = sum([len(tree) for tree in self.roots])
+    #     n_attrs = len(attrs) if attrs is not None else 0
+    #     X = np.zeros((n_nodes, 2 + self.n_obs + has_true_s + n_attrs), dtype=object)
         
-        i = 0
-        for root in self.roots:
-            queue = [root]
-            while queue:
-                node = queue.pop(0)
-                X[i, 0] = node.id
-                X[i, 1] = node.mother.id if node.mother is not None else np.nan
-                X[i, 2 : 2 + self.n_obs] = node.x
-                if has_true_s:
-                    X[i, 2 + self.n_obs] = node.s
-                if attrs is not None:
-                    for pos, attr in enumerate(attrs):
-                        node_attr = getattr(node, attr)
-                        X[i, 2 + self.n_obs + has_true_s + pos] = node_attr
+    #     i = 0
+    #     for root in self.roots:
+    #         queue = [root]
+    #         while queue:
+    #             node = queue.pop(0)
+    #             X[i, 0] = node.id
+    #             X[i, 1] = node.mother.id if node.mother is not None else np.nan
+    #             X[i, 2 : 2 + self.n_obs] = node.x
+    #             if has_true_s:
+    #                 X[i, 2 + self.n_obs] = node.s
+    #             if attrs is not None and attr_func is not None:
+    #                 attr_vals = [getattr(node, attr) for attr in attrs]
+    #                 X[i, 2 + self.n_obs + has_true_s] = attr_func(*attr_vals)
+    #             elif attrs is not None:
+    #                 for pos, attr in enumerate(attrs):
+    #                     node_attr = getattr(node, attr)
+    #                     X[i, 2 + self.n_obs + has_true_s + pos] = node_attr
 
-                i += 1
-                if node.d0 is not None:
-                    queue.append(node.d0)
-                if node.d1 is not None:
-                    queue.append(node.d1)
-        return X
-
-
-    def to_pandas(self, attrs=None):
-        ndarr = self.to_numpy(attrs=attrs)
-        
-        column_names = ['cell_id', 'mother_id'] + [f'x{i}' for i in range(self.n_obs)]
-        if self.roots[0].s is not None:
-            column_names.append('S')
-        
-        if attrs is not None:
-            column_names += attrs
-        
-        df = pd.DataFrame(
-            data=ndarr,
-            columns=column_names
-        )
-        if self.roots[0].s is not None:
-            df["S"] = df["S"].astype('Int64')
-        if not isinstance(self.roots[0].id, str):
-            df[["cell_id", "mother_id"]] = df[["cell_id", "mother_id"]].astype('Int64')
-        return df
+    #             i += 1
+    #             if node.d0 is not None:
+    #                 queue.append(node.d0)
+    #             if node.d1 is not None:
+    #                 queue.append(node.d1)
+    #     return X
 
 
-    def to_csv(self, path, attrs=None, **kwargs):
-        df = self.to_pandas(attrs=attrs)
-        df.to_csv(path, index=False, **kwargs)
+    
     
 
     @staticmethod
-    def from_numpy(X, n_hidden, n_obs, inds_dict, obs_func=None):
+    def from_numpy(X, n_hidden, n_obs, inds_dict, has_true_s=False, obs_func=None):
         """
         Assumes the array X is in the format:
 
@@ -1817,12 +1862,13 @@ class HMForest(HMModel, Forest):
             self.roots.append(root)
             self.leaves += root.get_leaves()
 
-    @staticmethod
-    def from_pandas(df, n_hidden, n_obs, obs_cols, obs_func=None):
+    @classmethod
+    def from_pandas(cls, df, n_hidden, n_obs, obs_cols=None, obs_func=None):
+        obs_cols = obs_cols or [f"x{i}" for i in range(n_obs)]
         cols = df.columns.tolist()
         assert set(obs_cols).issubset(set(cols)), "obs_cols must be a subset of the dataframe columns"
         
-        forest = HMForest(n_hidden, n_obs)
+        forest = cls(n_hidden=n_hidden, n_obs=n_obs)
         forest.add_nodes_from_pandas(df=df, obs_cols=obs_cols, obs_func=obs_func)
         return forest
 
@@ -1831,6 +1877,72 @@ class HMForest(HMModel, Forest):
     def from_csv(path, n_hidden, n_obs, obs_cols, obs_func=None, **csv_kwargs):
         df = pd.read_csv(path, **csv_kwargs)
         return HMForest.from_pandas(df=df, n_hidden=n_hidden, n_obs=n_obs, obs_cols=obs_cols, obs_func=obs_func)
+    
+
+    def to_numpy(self, return_cols=False, combine_t=False, include_ids=True):
+        columns = []
+        for attr in ['d', 's', 'ml_s']:
+            if len(self.where(attr, lambda x: x is not None)):
+                columns.append(attr)
+        
+        forest = []
+        for tree_id, root in enumerate(self.roots):
+            tree_id += 1
+            for node in root.to_list():
+                mother_id = np.nan if node.mother is None else node.mother.id
+                if combine_t and node.t is not None:
+                    x = node.x if np.all(node.t == -np.inf) else log_addition(node.x, node.t)
+                else:
+                    x = node.x
+                if include_ids:
+                    data = [tree_id, node.id, mother_id] + list(x) + [getattr(node, attr) for attr in columns]
+                else:
+                    data = list(x) + [getattr(node, attr) for attr in columns]
+                forest.append(data)
+    
+        if return_cols:
+            return np.array(forest), columns
+        return np.array(forest)
+    
+    def to_pandas(self, obs_cols=None, combine_t=False):
+        forest_arr, columns = self.to_numpy(return_cols=True, combine_t=combine_t)
+        columns = [col.capitalize() if col in ['d', 's'] else col for col in columns ]
+        obs_cols = obs_cols or [f"x{i}" for i in range(self.n_obs)]
+        df = pd.DataFrame(
+            data=forest_arr,
+            columns=["Tree ID", "Cell ID", "Mother ID"] + obs_cols + columns
+        )
+        df[columns] = df[columns].astype(int)
+        return df
+
+    def to_csv(self, path, obs_cols=None, combine_t=False, **kwargs):
+        df = self.to_pandas(obs_cols=obs_cols, combine_t=combine_t)
+        df.to_csv(path, index=False, **kwargs)
+
+            
+
+        
+        
+
+    # def to_pandas(self, obs_cols=None):
+    #     ndarr = self.to_numpy(attrs=attrs)
+        
+    #     column_names = ['Cell ID', 'Mother ID'] + [f'x{i}' for i in range(self.n_obs)]
+    #     if self.roots[0].s is not None:
+    #         column_names.append('S')
+        
+    #     if attrs is not None:
+    #         column_names += attrs
+        
+    #     df = pd.DataFrame(
+    #         data=ndarr,
+    #         columns=column_names
+    #     )
+    #     if self.roots[0].s is not None:
+    #         df["S"] = df["S"].astype('Int64')
+    #     if not isinstance(self.roots[0].id, str):
+    #         df[["cell_id", "mother_id"]] = df[["cell_id", "mother_id"]].astype('Int64')
+    #     return df
 
 
     """ ##### Accuracy + Permutations ##### """

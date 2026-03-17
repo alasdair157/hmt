@@ -5,7 +5,7 @@ import warnings
 import hmt.emissions as emissions
 from hmt.exceptions import HMTError
 from hmt.hidden_markov_tree import HMModel, HMNode, HMTree, HMForest
-from hmt.utils import digamma, rowwise_outer
+from hmt.utils import digamma, rowwise_outer, dirichlet_KL
 from collections import defaultdict
 
 logging.basicConfig(level=logging.ERROR, format="hmt %(levelname)s: %(message)s")
@@ -62,9 +62,9 @@ class VBHMModel(HMModel):
     def set_emissions(self, emission_distr="MVN", emission_kwargs={}):
         if isinstance(emission_distr, str):
             if emission_distr == "MVN":
-                self.emission_distr = emissions.VBMVN(self.n_hidden, self.n_obs, **emission_kwargs)
+                self.emission_distr = emissions.VBMVN(self.n_hidden, self.n_obs, hmmodel=self, **emission_kwargs)
             elif emission_distr == "Gamma":
-                self.emission_distr = emissions.VBMVGamma(self.n_hidden, self.n_obs, **emission_kwargs)
+                self.emission_distr = emissions.VBMVGamma(self.n_hidden, self.n_obs, hmmodel=self, **emission_kwargs)
             else:
                 raise NotImplementedError("Only MVN and Gamma distributions are implemented by default")
         else:
@@ -113,15 +113,17 @@ class VBHMModel(HMModel):
             if self.P_weights is None:
                 self.P_weights = np.abs(np.random.randn(self.n_hidden, self.n_hidden))
 
-        self.emission_distr.init_hyperparams(self, **emission_hyperparams)
+        self.emission_distr.init_hyperparams(**emission_hyperparams)
         
 
     def update_params(self):
-        self.init_s_distr = np.exp(
-            digamma(self.pi_weights) - digamma(np.sum(self.pi_weights))
-        )
-        # Normalise pi
-        self.init_s_distr /= self.init_s_distr.sum()
+        if self.pi_weights is not None:
+            self.init_s_distr = np.exp(
+                digamma(self.pi_weights) - digamma(np.sum(self.pi_weights))
+            )
+            # Normalise pi
+            self.init_s_distr /= self.init_s_distr.sum()
+
 
         if self.sister_dep:
             self.P = np.exp(
@@ -148,10 +150,7 @@ class VBHMModel(HMModel):
         """Updates the pi weights, different for tree and forest"""
         pass
 
-    
-    def update_hyperparams(self):
-        self.update_pi_weights()
-
+    def update_P_weights(self):
         if self.sister_dep:
             self.P_weights = self.prior_P_weights + self.sum('xi_f')
             if not self.daughter_order:
@@ -160,8 +159,12 @@ class VBHMModel(HMModel):
                 self.P_weights[:, diag_indices, diag_indices] /= 2
         else:
             self.P_weights = self.prior_P_weights + self.sum('m_d_xi')
-        
-        self.emission_distr.update_hyperparams(self)
+
+    
+    def update_hyperparams(self):
+        self.update_pi_weights()
+        self.update_P_weights()       
+        self.emission_distr.update_hyperparams()
         
 
     def clear_hyperparams(self):
@@ -172,17 +175,17 @@ class VBHMModel(HMModel):
 
     def get_hyperparams(self):
         return {
-            "pi_weights": self.pi_weights,
-            "P_weights": self.P_weights,
+            "pi_weights": self.pi_weights.copy() if self.pi_weights is not None else None,
+            "P_weights": self.P_weights.copy() if self.P_weights is not None else None,
             **self.emission_distr.get_hyperparams()
         }
     
 
     def set_hyperparams(self, pi_weights=None, P_weights=None, **emission_hyperparams):
         if pi_weights is not None:
-            self.pi_weights = pi_weights
+            self.pi_weights = pi_weights.copy()
         if P_weights is not None:
-            self.P_weights = P_weights
+            self.P_weights = P_weights.copy()
         self.emission_distr.set_hyperparams(**emission_hyperparams)
     
 
@@ -205,8 +208,16 @@ class VBHMModel(HMModel):
             **all_emission_params
             ):
         self.set_params(init_s_distr=init_s_distr, P=P, sister_dep=sister_dep, daughter_order=daughter_order, check_params=check_params)
-        self.set_hyperparams(pi_weights=pi_weights, P_weights=P_weights, check_params=check_params)
+        self.set_hyperparams(pi_weights=pi_weights, P_weights=P_weights)
         self.emission_distr.set_params_and_hyperparams(**all_emission_params)
+    
+    def prior_KL_div(self):
+        q_KL = dirichlet_KL(self.P_weights, self.prior_P_weights)
+        q_KL += self.emission_distr.prior_KL_div()
+        return q_KL.sum() + dirichlet_KL(self.pi_weights, self.prior_pi_weights)
+
+    def ELBO(self):
+        return self.Estep() - self.prior_KL_div()
     
     def Mstep(self):
         self.update_hyperparams()
@@ -452,11 +463,11 @@ class VBHMForest(VBHMModel, HMForest):
         return forest
 
 
-    @staticmethod
-    def from_pandas(df, n_hidden, n_obs, obs_func=None):
-        has_true_s = 's' in df.columns.tolist()
-        has_tree_id = 'Tree ID' in df.columns.tolist()
-        return VBHMForest.from_numpy(df.to_numpy(na_value=np.nan), n_hidden, n_obs, has_true_s, has_tree_id, obs_func=obs_func)
+    # @staticmethod
+    # def from_pandas(df, n_hidden, n_obs, obs_func=None):
+    #     has_true_s = 's' in df.columns.tolist()
+    #     has_tree_id = 'Tree ID' in df.columns.tolist()
+    #     return VBHMForest.from_numpy(df.to_numpy(na_value=np.nan), n_hidden, n_obs, has_true_s, has_tree_id, obs_func=obs_func)
 
 
     @staticmethod

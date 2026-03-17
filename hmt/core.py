@@ -108,7 +108,8 @@ class Node():
             plot_death=True,
             death_gap=1,
             plot_next=True,
-            next_gap=0
+            next_gap=0,
+            censor_gap=0
             ):
         colors = ["C2", "C0", "C1", "y"]
         if ax is None:
@@ -119,7 +120,9 @@ class Node():
                 *[getattr(self, attr) for attr in length_attr]
             )
         else:
-            _length_attr = getattr(self, length_attr).copy() if length_attr is not None else 1
+            _length_attr = getattr(self, length_attr) if length_attr is not None else 1
+            if isinstance(_length_attr, np.ndarray):
+                _length_attr = _length_attr.copy()
             # print(_length_attr)
             _length_attr = length_func(_length_attr) if length_func is not None else _length_attr
         
@@ -131,7 +134,10 @@ class Node():
             if self.d1 is not None:
                 ax.plot((x_start + dx * _length_attr, x_start + dx * _length_attr), (y_start, y_start + dy), c=color)
                 self.d1.plot(
-                    ax=ax, length_attr=length_attr, length_func=length_func, color_attr=color_attr, x_start=x_start + dx * _length_attr, y_start=y_start + dy, dx=dx, dy=dy / 2
+                    ax=ax, length_attr=length_attr, length_func=length_func, color_attr=color_attr,
+                    x_start=x_start + dx * _length_attr, y_start=y_start + dy, dx=dx, dy=dy / 2,
+                    plot_death=plot_death, death_gap=death_gap,
+                    plot_next=plot_next, next_gap=next_gap, censor_gap=censor_gap
                     )
             
             ax.plot((x_start, x_start + dx * _length_attr), (y_start, y_start), c=color)
@@ -139,14 +145,28 @@ class Node():
             if self.d0 is not None:
                 ax.plot((x_start + dx * _length_attr, x_start + dx * _length_attr), (y_start, y_start - dy), c=color)
                 self.d0.plot(
-                    ax=ax, length_attr=length_attr, length_func=length_func, color_attr=color_attr, x_start=x_start + dx * _length_attr, y_start=y_start - dy, dx=dx, dy=dy / 2
+                    ax=ax, length_attr=length_attr, length_func=length_func, color_attr=color_attr,
+                    x_start=x_start + dx * _length_attr, y_start=y_start - dy, dx=dx, dy=dy / 2,
+                    plot_death=plot_death, death_gap=death_gap,
+                    plot_next=plot_next, next_gap=next_gap, censor_gap=censor_gap
                     )
+            
+            if self.next is not None and plot_next:
+                self.next.plot(
+                    ax=ax, length_attr=length_attr, length_func=length_func, color_attr=color_attr,
+                    x_start=x_start + dx * _length_attr, y_start=y_start, dx=dx, dy=dy,
+                    plot_death=plot_death, death_gap=death_gap,
+                    plot_next=plot_next, next_gap=next_gap, censor_gap=censor_gap
+                    )
+
+            if plot_death and self.d is not None and self.d:
+                ax.plot(x_start + dx * _length_attr + death_gap, y_start, markersize=6, marker='x', color='red')
         
         if isinstance(_length_attr, np.ndarray):
             tot_length = np.sum(_length_attr[~np.isnan(_length_attr)])
             d_color = colors[0]
             if self.d1 is not None:
-                ax.plot((x_start + dx * tot_length, x_start + dx * tot_length), (y_start, y_start + dy), c=d_color)
+                ax.plot((x_start + dx * tot_length, x_start + dx * tot_length), (y_start, y_start + dy), c=d_color, lw=2)
                 self.d1.plot(
                     ax=ax,
                     length_attr=length_attr,
@@ -156,18 +176,24 @@ class Node():
                     y_start=y_start + dy,
                     dx=dx, dy=dy / 2,
                     plot_death=plot_death, death_gap=death_gap,
-                    plot_next=plot_next, next_gap=next_gap
+                    plot_next=plot_next, next_gap=next_gap, censor_gap=censor_gap
                     )
             curr_x = x_start
             for i, length in enumerate(_length_attr):
                 if not np.isnan(length):
                     next_x = curr_x + dx * length
-                    ax.plot((curr_x, next_x), (y_start, y_start), c=colors[i])
+                    ax.plot((curr_x, next_x), (y_start, y_start), c=colors[i], lw=2)
                     curr_x = next_x
+                    if self.c is not None and not np.isnan(self.c[i]):
+                        if (i < len(_length_attr) - 1 and not np.isnan(_length_attr[i + 1]) or
+                            self.next is not None or (self.mother is None and self.prev is None)
+                        ):
+                            continue
+                        ax.plot(next_x + censor_gap, y_start, markersize=6, marker='>', color=colors[i])
 
 
             if self.d0 is not None:
-                ax.plot((x_start + dx * tot_length, x_start + dx * tot_length), (y_start, y_start - dy), c=d_color)
+                ax.plot((x_start + dx * tot_length, x_start + dx * tot_length), (y_start, y_start - dy), c=d_color, lw=2)
                 self.d0.plot(
                     ax=ax,
                     length_attr=length_attr,
@@ -177,7 +203,7 @@ class Node():
                     y_start=y_start - dy,
                     dx=dx, dy=dy / 2,
                     plot_death=plot_death, death_gap=death_gap,
-                    plot_next=plot_next, next_gap=next_gap
+                    plot_next=plot_next, next_gap=next_gap, censor_gap=censor_gap
                     )
             
             if self.next is not None and plot_next:
@@ -190,15 +216,13 @@ class Node():
                     y_start=y_start,
                     dx=dx, dy=dy,
                     plot_death=plot_death, death_gap=death_gap,
-                    plot_next=plot_next, next_gap=next_gap
+                    plot_next=plot_next, next_gap=next_gap, censor_gap=censor_gap
                     )
 
             if plot_death and self.d is not None and self.d:
-                ax.plot(curr_x + death_gap, y_start, markersize=5, marker='x', color='red')
+                ax.plot(curr_x + death_gap, y_start, markersize=6, marker='x', color='red')
             
         return ax
-
-    
 
     def xlen(self, attr_name='x'):
         """Returns the number of nodes for which attr is not nan"""
@@ -252,8 +276,13 @@ class Node():
 
     def where(self, attr, cond):
         nodes = []
-        if cond(getattr(self, attr)):
-            nodes.append(self)
+        if is_iterable(attr):
+            attrs = [getattr(self, attr_name) for attr_name in attr]
+            if cond(*attrs):
+                nodes.append(self)
+        else:
+            if cond(getattr(self, attr)):
+                nodes.append(self)
         if self.d0 is not None:
             nodes += self.d0.where(attr, cond)
         if self.d1 is not None:

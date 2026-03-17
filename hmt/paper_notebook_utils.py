@@ -7,26 +7,26 @@ import scipy.stats as stats
 from hmt.notebook_utils import plot_ellipses
 
 
-def get_gamma_pdf(x, hmmodel, hidden_state, obs):
-    alpha = hmmodel.emission_distr.alphas[hidden_state, obs]
-    beta = hmmodel.emission_distr.betas[hidden_state, obs]
+def get_gamma_pdf(x, emission_distr, hidden_state, obs):
+    alpha = emission_distr.alphas[hidden_state, obs]
+    beta = emission_distr.betas[hidden_state, obs]
     return stats.gamma.pdf(x, alpha, scale=1/beta)
 
-def get_normal_pdf(x, hmmodel, hidden_state, obs):
-    mu = hmmodel.emission_distr.mus[hidden_state, obs]
-    sigma = np.sqrt(hmmodel.emission_distr.sigmas[hidden_state, obs, obs])
+def get_normal_pdf(x, emission_distr, hidden_state, obs):
+    mu = emission_distr.mus[hidden_state, obs]
+    sigma = np.sqrt(emission_distr.sigmas[hidden_state, obs, obs])
     return stats.norm.pdf(x, mu, sigma)
 
-def get_lognormal_pdf(x, hmmodel, hidden_state, obs):
-    mu = hmmodel.emission_distr.mus[hidden_state, obs]
-    sigma = np.sqrt(hmmodel.emission_distr.sigmas[hidden_state, obs, obs])
+def get_lognormal_pdf(x, emission_distr, hidden_state, obs):
+    mu = emission_distr.mus[hidden_state, obs]
+    sigma = np.sqrt(emission_distr.sigmas[hidden_state, obs, obs])
     return stats.lognorm.pdf(x, scale=np.exp(mu), s=sigma)
 
 
-def plot_model_fit(df, hmmodel, n_hidden, n_obs, labels_dict=None, distr="lognormal", axes=None, **kwargs):
+def plot_model_fit(df, emission_distr, n_hidden, n_obs, labels=None, distr="lognormal", axes=None, **kwargs):
     if axes is None:
         _, axes = plt.subplots(1, n_obs, figsize=(15, 5), sharey=True)
-    labels_dict = labels_dict or {0: "G1", 1: "S", 2: "G2 + M"}
+    labels = labels or ["G1", "S", "G2 + M"]
     # stat_distr = hmmodel.P.sum(axis=(0, 2))
     # stat_distr /= stat_distr.sum()
     stat_distr = df['ml_s'].value_counts().sort_index().to_numpy().astype(float)
@@ -35,23 +35,23 @@ def plot_model_fit(df, hmmodel, n_hidden, n_obs, labels_dict=None, distr="lognor
         stat_distr = np.append(stat_distr, np.array([0] * (n_hidden - len(df['ml_s'].value_counts()))))
     stat_distr /= stat_distr.sum()
     
-    for j in range(n_obs):
-        x = np.linspace(0, df[f"x{j}"].max() + 10, 100)
+    for j, label in enumerate(labels):
+        x = np.linspace(0, df[label].max() + 10, 1000)
         for i in range(n_hidden):
             if distr == "gamma":
-                y = get_gamma_pdf(x, hmmodel, i, j)
+                y = get_gamma_pdf(x, emission_distr, i, j)
             elif distr == "normal":
-                y = get_normal_pdf(x, hmmodel, i, j)
+                y = get_normal_pdf(x, emission_distr, i, j)
             elif distr == "lognormal":
-                y = get_lognormal_pdf(x, hmmodel, i, j)
+                y = get_lognormal_pdf(x, emission_distr, i, j)
             else:
                 raise NotImplementedError("Invalid distribution")
-            # y *= stat_distr[i]
+            y *= stat_distr[i]
             axes[j].plot(x, y, color=f"C{i}")
         sns.histplot(
-            df, x=f"x{j}", hue="ml_s", stat="density", edgecolor=None,
+            df, x=label, hue="ml_s", stat="density", edgecolor=None,
             common_norm=True, ax=axes[j], legend=False, palette="tab10")
-        axes[j].set_title(labels_dict[j]); axes[j].set_xlabel(""); axes[j].set_ylabel("")
+        axes[j].set_title(label); axes[j].set_xlabel(""); axes[j].set_ylabel("")
     axes[0].set_ylabel("Density")
     return axes
 
@@ -104,4 +104,14 @@ def model_pair_plot(df, hmmodel, n_hidden, n_obs, labels_dict=None, distr="logno
     plt.tight_layout()
     return axes
     
+def multiple_starts(forest, alpha=0.1):
+    forest.init_hyperparams()
+    forest.next.prior_death_weights = alpha
+    forest.update_params()
+    
+    forest.find_missing_pattern()
+    forest.emission_distr.precalculate_matrices()
+    forest.next.call_distr_function("precalculate_matrices")
 
+    max_loglk = forest.Estep()
+    params = forest.get_params()
